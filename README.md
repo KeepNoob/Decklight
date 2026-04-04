@@ -25,6 +25,10 @@ decklight "Example.pdf"
 - Presenter window: current slide, next slide, notes panel, controls.
 - Projector window: clean content view, optional auto-advance badge, unsaved badge.
 - Swap displays with `S` (or `Swap Screens` button).
+- Zoom/pan controls:
+  - Pinch (trackpad) or `Ctrl/Cmd + wheel`: zoom
+  - Two-finger scroll (trackpad) or right/middle mouse drag: pan
+  - `Reset Zoom/Pan` button or double right-click: reset view
 
 ### 2) Notes Handling
 - Modes: `Auto`, `PDF annotations`, `Beamer second screen`, `LibreOffice notes`.
@@ -72,6 +76,14 @@ decklight "Example.pdf"
 
 ### 9) Auto Reload
 - If source PDF changes on disk, Decklight reloads it and keeps presentation state aligned.
+
+### 10) Performance Controls
+- Open the `Performance` popup from the top toolbar.
+- Configure:
+  - `Cache entries`
+  - `Cache budget MB`
+  - Per-view render widths (`Projector`, `Presenter`, `Next`, `Notes`)
+- Live cache usage line shows current entries and used/budget MB.
 
 ## Default Shortcuts (All Configurable)
 

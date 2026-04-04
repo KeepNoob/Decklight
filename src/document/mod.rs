@@ -1,6 +1,7 @@
 mod lopdf_backend;
 mod pdfium_backend;
 
+use crate::cache::CacheWeight;
 use crate::config::{NotesLayout, NotesMode};
 use anyhow::{Context, Result};
 pub use lopdf_backend::LopdfBackend;
@@ -12,6 +13,12 @@ pub struct PageBitmap {
     pub width: usize,
     pub height: usize,
     pub rgba: Vec<u8>,
+}
+
+impl CacheWeight for PageBitmap {
+    fn cache_weight_bytes(&self) -> usize {
+        self.rgba.len()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

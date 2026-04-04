@@ -269,6 +269,11 @@ impl AutoAdvanceDocumentConfig {
 pub struct AppConfig {
     pub config_version: u16,
     pub cache_size: usize,
+    pub cache_budget_mb: usize,
+    pub projector_render_width: usize,
+    pub presenter_render_width: usize,
+    pub next_render_width: usize,
+    pub notes_render_width: usize,
     pub startup_content_fullscreen: bool,
     pub notes_mode: NotesMode,
     pub notes_confidence_threshold: f32,
@@ -287,6 +292,11 @@ impl Default for AppConfig {
         Self {
             config_version: 4,
             cache_size: 200,
+            cache_budget_mb: 768,
+            projector_render_width: 1920,
+            presenter_render_width: 1280,
+            next_render_width: 896,
+            notes_render_width: 1024,
             startup_content_fullscreen: true,
             notes_mode: NotesMode::Auto,
             notes_confidence_threshold: 0.35,
@@ -338,6 +348,11 @@ impl AppConfig {
 
     fn sanitize(&mut self) {
         self.cache_size = self.cache_size.max(1);
+        self.cache_budget_mb = self.cache_budget_mb.clamp(64, 8192);
+        self.projector_render_width = self.projector_render_width.clamp(640, 4096);
+        self.presenter_render_width = self.presenter_render_width.clamp(640, 4096);
+        self.next_render_width = self.next_render_width.clamp(640, 4096);
+        self.notes_render_width = self.notes_render_width.clamp(640, 4096);
         self.presenter_layout.preview_slides = self.presenter_layout.preview_slides.clamp(1, 16);
         self.notes_confidence_threshold = self.notes_confidence_threshold.clamp(0.05, 0.95);
         self.overview_thumbnail_width = self.overview_thumbnail_width.clamp(120, 800);
@@ -384,6 +399,11 @@ mod tests {
         let raw = r#"
 config_version = 1
 cache_size = 0
+cache_budget_mb = 12
+projector_render_width = 100
+presenter_render_width = 99999
+next_render_width = 123
+notes_render_width = 7000
 startup_content_fullscreen = true
 notes_mode = "auto"
 notes_confidence_threshold = 1.5
@@ -425,6 +445,11 @@ global_interval_secs = 99999
         let loaded = AppConfig::load_from_path(&path).expect("load config");
 
         assert_eq!(loaded.cache_size, 1);
+        assert_eq!(loaded.cache_budget_mb, 64);
+        assert_eq!(loaded.projector_render_width, 640);
+        assert_eq!(loaded.presenter_render_width, 4096);
+        assert_eq!(loaded.next_render_width, 640);
+        assert_eq!(loaded.notes_render_width, 4096);
         assert_eq!(loaded.presenter_layout.preview_slides, 16);
         assert_eq!(loaded.notes_confidence_threshold, 0.95);
         assert_eq!(loaded.overview_thumbnail_width, 120);
@@ -460,6 +485,11 @@ global_interval_secs = 99999
         let raw = r#"
 config_version = 4
 cache_size = 200
+cache_budget_mb = 768
+projector_render_width = 1920
+presenter_render_width = 1280
+next_render_width = 896
+notes_render_width = 1024
 startup_content_fullscreen = true
 notes_mode = "auto"
 notes_confidence_threshold = 0.35

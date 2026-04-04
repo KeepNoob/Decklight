@@ -4,20 +4,21 @@ mod state;
 pub use command::AppCommand;
 pub use state::PresentationState;
 
-use crate::cache::PageCache;
+use crate::cache::{CacheWeight, PageCache};
 use crate::config::{
     AppConfig, AutoAdvanceDocumentConfig, KeybindingConfig, NotesLayout, NotesLayoutOverrideConfig,
     NotesMode, NotesSide, PenPreset, SplitAxis,
 };
 use crate::document::{
     AnnotationMetadata, AnnotationPriority, AnnotationStatus, DocumentBackend, NewInkAnnotation,
-    NewTextAnnotation, PageBitmap, PageGeometry, PageView, PdfRect, TextAnnotation, open_document,
+    NewTextAnnotation, PageGeometry, PageView, PdfRect, TextAnnotation, open_document,
 };
 use anyhow::{Result, anyhow};
 use chrono::Local;
 use eframe::egui::{
-    self, Align, Align2, Color32, Context, FontFamily, FontId, Key, Modifiers, Pos2, Rect,
-    RichText, Sense, Stroke, TextureHandle, TextureOptions, Vec2, ViewportBuilder, ViewportId,
+    self, Align, Align2, Color32, Context, FontFamily, FontId, Key, Modifiers, PointerButton, Pos2,
+    Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, Vec2, ViewportBuilder,
+    ViewportId,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -58,11 +59,13 @@ struct PresenterApp {
     status_message: Option<String>,
     last_reload_check: Instant,
     projector_viewport: ViewportId,
-    page_cache: PageCache<PageBitmap>,
+    texture_cache: PageCache<CachedTexture>,
     projector_texture: Option<TextureHandle>,
     projector_texture_key: Option<usize>,
+    projector_zoom_pan: ZoomPanState,
     current_texture: Option<TextureHandle>,
     current_texture_key: Option<usize>,
+    presenter_zoom_pan: ZoomPanState,
     presenter_texture: Option<TextureHandle>,
     presenter_texture_key: Option<usize>,
     notes_texture: Option<TextureHandle>,
@@ -101,6 +104,7 @@ struct PresenterApp {
     auto_override_editor_secs: u32,
     auto_override_editor_index: Option<usize>,
     timing_breakdown: TimingBreakdownState,
+    performance_panel_open: bool,
     shortcut_bindings: ShortcutBindings,
     keybinding_editor: BTreeMap<String, String>,
     keybinding_editor_dirty: bool,
@@ -142,11 +146,26 @@ enum SlideSurfaceSpace {
 
 #[derive(Debug, Clone, Copy)]
 struct LaserSurfaceSample {
-    rect: Rect,
+    surface_rect: Rect,
     pointer_pos: Option<Pos2>,
     ctrl_down: bool,
     primary_down: bool,
     hovered: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ZoomPanState {
+    zoom: f32,
+    pan: Vec2,
+}
+
+impl Default for ZoomPanState {
+    fn default() -> Self {
+        Self {
+            zoom: 1.0,
+            pan: Vec2::ZERO,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +197,18 @@ struct SessionInkStroke {
     color_rgb: (f32, f32, f32),
     width: f32,
     opacity: f32,
+}
+
+#[derive(Clone)]
+struct CachedTexture {
+    texture: TextureHandle,
+    byte_estimate: usize,
+}
+
+impl CacheWeight for CachedTexture {
+    fn cache_weight_bytes(&self) -> usize {
+        self.byte_estimate
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -647,7 +678,7 @@ impl PresenterApp {
         let keybinding_warning =
             (!shortcut_warnings.is_empty()).then(|| shortcut_warnings.join(" "));
         let mut app = Self {
-            page_cache: PageCache::new(config.cache_size),
+            texture_cache: PageCache::new(config.cache_size, Self::cache_budget_bytes_for(&config)),
             state: PresentationState::with_labels(1, vec!["1".to_owned()], now),
             config,
             config_path,
@@ -660,8 +691,10 @@ impl PresenterApp {
             projector_viewport: ViewportId::from_hash_of("projector_window"),
             projector_texture: None,
             projector_texture_key: None,
+            projector_zoom_pan: ZoomPanState::default(),
             current_texture: None,
             current_texture_key: None,
+            presenter_zoom_pan: ZoomPanState::default(),
             presenter_texture: None,
             presenter_texture_key: None,
             notes_texture: None,
@@ -700,6 +733,7 @@ impl PresenterApp {
             auto_override_editor_secs: auto_default_interval,
             auto_override_editor_index: None,
             timing_breakdown: TimingBreakdownState::default(),
+            performance_panel_open: false,
             shortcut_bindings,
             keybinding_editor,
             keybinding_editor_dirty: false,
@@ -799,6 +833,64 @@ impl PresenterApp {
                 }
             });
         });
+    }
+
+    fn render_performance_controls(&mut self, ui: &mut egui::Ui) {
+        ui.label("Tune texture cache limits and per-view render quality.");
+
+        let mut render_cache_changed = false;
+        render_cache_changed |= ui
+            .add(egui::Slider::new(&mut self.config.cache_size, 1..=1024).text("Cache entries"))
+            .changed();
+        render_cache_changed |= ui
+            .add(
+                egui::Slider::new(&mut self.config.cache_budget_mb, 64..=8192)
+                    .text("Cache budget MB"),
+            )
+            .changed();
+
+        ui.add_space(4.0);
+        ui.label("Per-view render width (pixels):");
+        render_cache_changed |= ui
+            .add(
+                egui::Slider::new(&mut self.config.projector_render_width, 640..=4096)
+                    .text("Projector width"),
+            )
+            .changed();
+        render_cache_changed |= ui
+            .add(
+                egui::Slider::new(&mut self.config.presenter_render_width, 640..=4096)
+                    .text("Presenter width"),
+            )
+            .changed();
+        render_cache_changed |= ui
+            .add(
+                egui::Slider::new(&mut self.config.next_render_width, 640..=4096)
+                    .text("Next width"),
+            )
+            .changed();
+        render_cache_changed |= ui
+            .add(
+                egui::Slider::new(&mut self.config.notes_render_width, 640..=4096)
+                    .text("Notes width"),
+            )
+            .changed();
+
+        if render_cache_changed {
+            self.invalidate_render_cache();
+            self.persist_config();
+        }
+
+        let bytes_per_mb = 1024.0 * 1024.0;
+        let used_mb = self.texture_cache.total_weight_bytes() as f32 / bytes_per_mb;
+        let budget_mb = self.texture_cache.max_weight_bytes() as f32 / bytes_per_mb;
+        ui.add_space(4.0);
+        ui.monospace(format!(
+            "Texture cache: {} entries, {:.1} MB / {:.1} MB",
+            self.texture_cache.len(),
+            used_mb,
+            budget_mb
+        ));
     }
 
     fn shortcut_consume(&self, ctx: &egui::Context, action: ShortcutAction) -> bool {
@@ -1099,11 +1191,32 @@ impl PresenterApp {
         self.lasso_path_in_progress.clear();
     }
 
+    fn cache_budget_bytes_for(config: &AppConfig) -> usize {
+        config
+            .cache_budget_mb
+            .saturating_mul(1024)
+            .saturating_mul(1024)
+            .max(1)
+    }
+
+    fn cache_budget_bytes(&self) -> usize {
+        Self::cache_budget_bytes_for(&self.config)
+    }
+
+    fn clear_overview_textures(&mut self) {
+        self.overview_textures.clear();
+        self.overview_texture_keys.clear();
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let typing_in_text_field = ctx.wants_keyboard_input();
 
         if !typing_in_text_field && self.shortcut_consume(ctx, ShortcutAction::ToggleDeckOverview) {
+            let was_open = self.deck_overview.is_open;
             self.deck_overview.toggle(self.state.current_index());
+            if was_open && !self.deck_overview.is_open {
+                self.clear_overview_textures();
+            }
         }
         if !typing_in_text_field
             && self.shortcut_consume(ctx, ShortcutAction::ToggleTimingBreakdown)
@@ -1116,10 +1229,12 @@ impl PresenterApp {
             let cols = self.config.overview_columns as usize;
             if self.shortcut_consume(ctx, ShortcutAction::OverviewCancel) {
                 self.deck_overview.cancel();
+                self.clear_overview_textures();
                 return;
             }
             if self.shortcut_consume(ctx, ShortcutAction::OverviewCommit) {
                 self.deck_overview.commit();
+                self.clear_overview_textures();
                 return;
             }
             if self.shortcut_consume(ctx, ShortcutAction::Previous) {
@@ -1408,6 +1523,8 @@ impl PresenterApp {
         self.temporary_laser_active = false;
         self.laser_persistent_seen_this_frame = false;
         self.laser_primary_down_seen_this_frame = false;
+        Self::reset_zoom_pan_state(&mut self.presenter_zoom_pan);
+        Self::reset_zoom_pan_state(&mut self.projector_zoom_pan);
         self.auto_override_editor_index = None;
         self.timing_breakdown.is_open = false;
         self.unsaved_toast_until = None;
@@ -1835,7 +1952,11 @@ impl PresenterApp {
         Some(Pos2::new(x, y))
     }
 
-    fn capture_laser_sample(ctx: &Context, response: &egui::Response) -> LaserSurfaceSample {
+    fn capture_laser_sample(
+        ctx: &Context,
+        response: &egui::Response,
+        surface_rect: Rect,
+    ) -> LaserSurfaceSample {
         let pointer_pos = response.interact_pointer_pos().or_else(|| {
             response
                 .hovered()
@@ -1844,7 +1965,7 @@ impl PresenterApp {
         });
 
         LaserSurfaceSample {
-            rect: response.rect,
+            surface_rect,
             pointer_pos,
             ctrl_down: ctx.input(|input| input.modifiers.ctrl),
             primary_down: ctx.input(|input| input.pointer.primary_down()),
@@ -1874,7 +1995,7 @@ impl PresenterApp {
         }
         if let Some(pointer) = sample.pointer_pos
             && let Some(normalized) =
-                Self::screen_to_page_normalized(sample.rect, region, pointer, space)
+                Self::screen_to_page_normalized(sample.surface_rect, region, pointer, space)
         {
             if sample.ctrl_down && sample.primary_down {
                 self.temporary_laser_active = true;
@@ -1906,6 +2027,7 @@ impl PresenterApp {
     fn draw_laser_overlay(
         ui: &egui::Ui,
         image_rect: Rect,
+        clip_rect: Rect,
         laser_position: Option<(f32, f32)>,
         region: SlideRegion,
         space: SlideSurfaceSpace,
@@ -1918,7 +2040,7 @@ impl PresenterApp {
         else {
             return;
         };
-        let painter = ui.painter_at(image_rect);
+        let painter = ui.painter().with_clip_rect(clip_rect);
         painter.circle_filled(
             screen_position,
             14.0,
@@ -2534,6 +2656,7 @@ impl PresenterApp {
     fn handle_current_slide_interaction(
         &mut self,
         response: &egui::Response,
+        image_rect: Rect,
         index: usize,
         layout: Option<NotesLayout>,
     ) {
@@ -2550,19 +2673,20 @@ impl PresenterApp {
         let region = Self::slide_region(layout);
         match self.active_highlight_tool {
             HighlightTool::Eraser => {
-                if response.drag_started() {
+                if response.drag_started_by(PointerButton::Primary) {
                     self.eraser_erased_in_drag.clear();
                     self.eraser_removed_this_drag = false;
                     self.stroke_in_progress.clear();
                     self.stroke_in_progress_style = None;
                     self.lasso_path_in_progress.clear();
                 }
-                if (response.drag_started() || response.dragged())
+                if (response.drag_started_by(PointerButton::Primary)
+                    || response.dragged_by(PointerButton::Primary))
                     && let Some(pointer_pos) = response.interact_pointer_pos()
                 {
-                    self.erase_strokes_at_pointer(index, response.rect, region, pointer_pos);
+                    self.erase_strokes_at_pointer(index, image_rect, region, pointer_pos);
                 }
-                if response.drag_stopped() {
+                if response.drag_stopped_by(PointerButton::Primary) {
                     self.eraser_erased_in_drag.clear();
                     if self.eraser_removed_this_drag {
                         self.show_unsaved_edit_feedback("Eraser removed stroke(s) (unsaved).");
@@ -2571,15 +2695,16 @@ impl PresenterApp {
                 }
             }
             HighlightTool::Lasso => {
-                if response.drag_started() {
+                if response.drag_started_by(PointerButton::Primary) {
                     self.lasso_path_in_progress.clear();
                     self.stroke_in_progress.clear();
                     self.stroke_in_progress_style = None;
                 }
-                if (response.drag_started() || response.dragged())
+                if (response.drag_started_by(PointerButton::Primary)
+                    || response.dragged_by(PointerButton::Primary))
                     && let Some(pointer_pos) = response.interact_pointer_pos()
                     && let Some(normalized) = Self::screen_to_page_normalized(
-                        response.rect,
+                        image_rect,
                         region,
                         pointer_pos,
                         SlideSurfaceSpace::CroppedSlide,
@@ -2594,12 +2719,12 @@ impl PresenterApp {
                         self.lasso_path_in_progress.push(normalized);
                     }
                 }
-                if response.drag_stopped() {
+                if response.drag_stopped_by(PointerButton::Primary) {
                     self.finish_lasso_selection(index);
                 }
             }
             HighlightTool::Draw => {
-                if response.drag_started() {
+                if response.drag_started_by(PointerButton::Primary) {
                     self.stroke_in_progress.clear();
                     self.lasso_path_in_progress.clear();
                     let preset = self.active_pen_preset();
@@ -2609,10 +2734,11 @@ impl PresenterApp {
                         opacity: preset.opacity,
                     });
                 }
-                if (response.drag_started() || response.dragged())
+                if (response.drag_started_by(PointerButton::Primary)
+                    || response.dragged_by(PointerButton::Primary))
                     && let Some(pointer_pos) = response.interact_pointer_pos()
                     && let Some(normalized) = Self::screen_to_page_normalized(
-                        response.rect,
+                        image_rect,
                         region,
                         pointer_pos,
                         SlideSurfaceSpace::CroppedSlide,
@@ -2648,7 +2774,7 @@ impl PresenterApp {
                         self.stroke_in_progress.push(normalized);
                     }
                 }
-                if response.drag_stopped() {
+                if response.drag_stopped_by(PointerButton::Primary) {
                     self.finalize_stroke(index);
                     self.eraser_erased_in_drag.clear();
                     self.eraser_removed_this_drag = false;
@@ -2937,6 +3063,7 @@ impl PresenterApp {
     fn handle_annotation_interaction(
         &mut self,
         response: &egui::Response,
+        image_rect: Rect,
         index: usize,
         layout: Option<NotesLayout>,
     ) {
@@ -2953,13 +3080,13 @@ impl PresenterApp {
         };
         let region = Self::slide_region(layout);
 
-        if response.clicked()
+        if response.clicked_by(PointerButton::Primary)
             && let Some(pointer) = response.interact_pointer_pos()
         {
             let mut selected = None;
             for annotation in self.text_annotations.iter().rev() {
                 if let Some(rect) =
-                    Self::annotation_screen_rect(response.rect, region, annotation, geometry)
+                    Self::annotation_screen_rect(image_rect, region, annotation, geometry)
                     && rect.contains(pointer)
                 {
                     selected = Some(annotation.id.clone());
@@ -2973,7 +3100,7 @@ impl PresenterApp {
             .interact_pointer_pos()
             .or_else(|| response.ctx.input(|input| input.pointer.interact_pos()));
         let primary_down = response.ctx.input(|input| input.pointer.primary_down());
-        let pointer_on_surface = pointer_pos.is_some_and(|pointer| response.rect.contains(pointer));
+        let pointer_on_surface = pointer_pos.is_some_and(|pointer| image_rect.contains(pointer));
 
         if self.active_text_transform.is_none()
             && primary_down
@@ -2984,7 +3111,7 @@ impl PresenterApp {
             let selected_first = self.selected_annotation().into_iter();
             for annotation in selected_first.chain(self.text_annotations.iter().rev()) {
                 let Some(rect) =
-                    Self::annotation_screen_rect(response.rect, region, annotation, geometry)
+                    Self::annotation_screen_rect(image_rect, region, annotation, geometry)
                 else {
                     continue;
                 };
@@ -3008,7 +3135,7 @@ impl PresenterApp {
 
             if let Some((annotation_id, mode, start_rect)) = picked
                 && let Some(start_pointer) = Self::screen_to_page_normalized(
-                    response.rect,
+                    image_rect,
                     region,
                     pointer,
                     SlideSurfaceSpace::CroppedSlide,
@@ -3028,7 +3155,7 @@ impl PresenterApp {
             && let Some(pointer) = pointer_pos
             && let Some(active) = self.active_text_transform.as_ref()
             && let Some(current_pointer) = Self::screen_to_page_normalized(
-                response.rect,
+                image_rect,
                 region,
                 pointer,
                 SlideSurfaceSpace::CroppedSlide,
@@ -3086,13 +3213,14 @@ impl PresenterApp {
     fn draw_highlight_overlay_from_snapshot(
         ui: &egui::Ui,
         image_rect: Rect,
+        clip_rect: Rect,
         region: SlideRegion,
         surface_space: SlideSurfaceSpace,
         overlay: &HighlightOverlaySnapshot,
         show_selected_strokes: bool,
         show_lasso: bool,
     ) {
-        let painter = ui.painter_at(image_rect);
+        let painter = ui.painter().with_clip_rect(clip_rect);
 
         for stroke in &overlay.strokes {
             let stroke_style = Stroke::new(
@@ -3195,6 +3323,7 @@ impl PresenterApp {
         &self,
         ui: &egui::Ui,
         image_rect: Rect,
+        clip_rect: Rect,
         index: usize,
         layout: Option<NotesLayout>,
     ) {
@@ -3203,6 +3332,7 @@ impl PresenterApp {
         Self::draw_highlight_overlay_from_snapshot(
             ui,
             image_rect,
+            clip_rect,
             region,
             SlideSurfaceSpace::CroppedSlide,
             &overlay,
@@ -3210,7 +3340,7 @@ impl PresenterApp {
             true,
         );
 
-        let painter = ui.painter_at(image_rect);
+        let painter = ui.painter().with_clip_rect(clip_rect);
 
         if self.interaction_mode() != InteractionMode::AnnotationEdit {
             return;
@@ -3652,14 +3782,13 @@ impl PresenterApp {
     }
 
     fn invalidate_render_cache(&mut self) {
-        self.page_cache = PageCache::new(self.config.cache_size);
+        self.texture_cache = PageCache::new(self.config.cache_size, self.cache_budget_bytes());
         self.projector_texture_key = None;
         self.current_texture_key = None;
         self.presenter_texture_key = None;
         self.notes_texture_key = None;
         self.next_texture_key = None;
-        self.overview_textures.clear();
-        self.overview_texture_keys.clear();
+        self.clear_overview_textures();
         self.reset_layout_resolution();
         self.text_annotation_cache_index = None;
         self.original_text_annotations.clear();
@@ -3733,14 +3862,16 @@ impl PresenterApp {
         key
     }
 
-    fn bitmap_cache_key(
+    fn texture_cache_key(
         index: usize,
         mode: NotesMode,
         view: PageView,
         layout: Option<NotesLayout>,
         target_width: usize,
+        namespace: usize,
     ) -> usize {
         let mut key = 23usize;
+        key = key.wrapping_mul(131).wrapping_add(namespace);
         key = key.wrapping_mul(131).wrapping_add(index);
         key = key.wrapping_mul(131).wrapping_add(Self::mode_id(mode));
         key = key.wrapping_mul(131).wrapping_add(Self::view_id(view));
@@ -3753,16 +3884,25 @@ impl PresenterApp {
         key
     }
 
-    fn get_or_render_bitmap(
+    fn get_or_render_texture(
         &mut self,
+        ctx: &Context,
         index: usize,
         view: PageView,
         layout: Option<NotesLayout>,
         target_width: usize,
-    ) -> Result<(usize, PageBitmap)> {
-        let key = Self::bitmap_cache_key(index, self.config.notes_mode, view, layout, target_width);
-        if let Some(bitmap) = self.page_cache.get(key) {
-            return Ok((key, bitmap.clone()));
+        namespace: usize,
+    ) -> Result<(usize, TextureHandle)> {
+        let key = Self::texture_cache_key(
+            index,
+            self.config.notes_mode,
+            view,
+            layout,
+            target_width,
+            namespace,
+        );
+        if let Some(entry) = self.texture_cache.get(key) {
+            return Ok((key, entry.texture.clone()));
         }
 
         let document = self
@@ -3770,13 +3910,23 @@ impl PresenterApp {
             .as_ref()
             .ok_or_else(|| anyhow!("no document loaded"))?;
         let bitmap = document.render_page_bitmap(index, view, layout, target_width)?;
-        self.page_cache.put(key, bitmap.clone());
+        let byte_estimate = bitmap.rgba.len();
+        let image =
+            egui::ColorImage::from_rgba_unmultiplied([bitmap.width, bitmap.height], &bitmap.rgba);
+        let texture = ctx.load_texture(
+            format!("page_texture_{namespace}_{key}"),
+            image,
+            TextureOptions::LINEAR,
+        );
 
-        Ok((key, bitmap))
-    }
-
-    fn color_image(bitmap: &PageBitmap) -> egui::ColorImage {
-        egui::ColorImage::from_rgba_unmultiplied([bitmap.width, bitmap.height], &bitmap.rgba)
+        self.texture_cache.put(
+            key,
+            CachedTexture {
+                texture: texture.clone(),
+                byte_estimate,
+            },
+        );
+        Ok((key, texture))
     }
 
     fn resolve_layout_for_slide(&mut self, index: usize) -> Option<NotesLayout> {
@@ -3838,6 +3988,10 @@ impl PresenterApp {
         let Some(_) = self.document else {
             return;
         };
+        let projector_width = self.config.projector_render_width;
+        let presenter_width = self.config.presenter_render_width;
+        let next_width = self.config.next_render_width;
+        let notes_width = self.config.notes_render_width;
         let projector_index = self.state.current_index();
         let presenter_index = if self.deck_overview.is_open {
             self.deck_overview
@@ -3852,26 +4006,17 @@ impl PresenterApp {
         let next_layout = self.resolve_layout_for_slide(next_index);
 
         if Self::has_visible_region(projector_layout, PageView::SlideOnly) {
-            match self.get_or_render_bitmap(
+            match self.get_or_render_texture(
+                ctx,
                 projector_index,
                 PageView::SlideOnly,
                 projector_layout,
-                1920,
+                projector_width,
+                1,
             ) {
-                Ok((key, bitmap)) => {
-                    if self.projector_texture_key != Some(key) {
-                        let image = Self::color_image(&bitmap);
-                        if let Some(texture) = self.projector_texture.as_mut() {
-                            texture.set(image, TextureOptions::LINEAR);
-                        } else {
-                            self.projector_texture = Some(ctx.load_texture(
-                                "projector_page",
-                                image,
-                                TextureOptions::LINEAR,
-                            ));
-                        }
-                        self.projector_texture_key = Some(key);
-                    }
+                Ok((key, texture)) => {
+                    self.projector_texture = Some(texture);
+                    self.projector_texture_key = Some(key);
                 }
                 Err(error) => {
                     self.open_error = Some(format!("Projector render failed: {error}"));
@@ -3883,26 +4028,17 @@ impl PresenterApp {
         }
 
         if Self::has_visible_region(presenter_layout, PageView::SlideOnly) {
-            match self.get_or_render_bitmap(
+            match self.get_or_render_texture(
+                ctx,
                 presenter_index,
                 PageView::SlideOnly,
                 presenter_layout,
-                1440,
+                presenter_width,
+                1,
             ) {
-                Ok((key, bitmap)) => {
-                    if self.current_texture_key != Some(key) {
-                        let image = Self::color_image(&bitmap);
-                        if let Some(texture) = self.current_texture.as_mut() {
-                            texture.set(image, TextureOptions::LINEAR);
-                        } else {
-                            self.current_texture = Some(ctx.load_texture(
-                                "current_page",
-                                image,
-                                TextureOptions::LINEAR,
-                            ));
-                        }
-                        self.current_texture_key = Some(key);
-                    }
+                Ok((key, texture)) => {
+                    self.current_texture = Some(texture);
+                    self.current_texture_key = Some(key);
                 }
                 Err(error) => {
                     self.open_error = Some(format!("Current slide render failed: {error}"));
@@ -3913,18 +4049,17 @@ impl PresenterApp {
             self.current_texture_key = None;
         }
 
-        match self.get_or_render_bitmap(presenter_index, PageView::Full, presenter_layout, 1440) {
-            Ok((key, bitmap)) => {
-                if self.presenter_texture_key != Some(key) {
-                    let image = Self::color_image(&bitmap);
-                    if let Some(texture) = self.presenter_texture.as_mut() {
-                        texture.set(image, TextureOptions::LINEAR);
-                    } else {
-                        self.presenter_texture =
-                            Some(ctx.load_texture("presenter_page", image, TextureOptions::LINEAR));
-                    }
-                    self.presenter_texture_key = Some(key);
-                }
+        match self.get_or_render_texture(
+            ctx,
+            presenter_index,
+            PageView::Full,
+            presenter_layout,
+            presenter_width,
+            1,
+        ) {
+            Ok((key, texture)) => {
+                self.presenter_texture = Some(texture);
+                self.presenter_texture_key = Some(key);
             }
             Err(error) => {
                 self.open_error = Some(format!("Presenter render failed: {error}"));
@@ -3934,18 +4069,17 @@ impl PresenterApp {
         if next_index != presenter_index
             && Self::has_visible_region(next_layout, PageView::SlideOnly)
         {
-            match self.get_or_render_bitmap(next_index, PageView::SlideOnly, next_layout, 1024) {
-                Ok((key, bitmap)) => {
-                    if self.next_texture_key != Some(key) {
-                        let image = Self::color_image(&bitmap);
-                        if let Some(texture) = self.next_texture.as_mut() {
-                            texture.set(image, TextureOptions::LINEAR);
-                        } else {
-                            self.next_texture =
-                                Some(ctx.load_texture("next_page", image, TextureOptions::LINEAR));
-                        }
-                        self.next_texture_key = Some(key);
-                    }
+            match self.get_or_render_texture(
+                ctx,
+                next_index,
+                PageView::SlideOnly,
+                next_layout,
+                next_width,
+                1,
+            ) {
+                Ok((key, texture)) => {
+                    self.next_texture = Some(texture);
+                    self.next_texture_key = Some(key);
                 }
                 Err(error) => {
                     self.open_error = Some(format!("Next slide render failed: {error}"));
@@ -3957,23 +4091,17 @@ impl PresenterApp {
         }
 
         if Self::has_visible_region(presenter_layout, PageView::NotesOnly) {
-            match self.get_or_render_bitmap(
+            match self.get_or_render_texture(
+                ctx,
                 presenter_index,
                 PageView::NotesOnly,
                 presenter_layout,
-                1440,
+                notes_width,
+                1,
             ) {
-                Ok((key, bitmap)) => {
-                    if self.notes_texture_key != Some(key) {
-                        let image = Self::color_image(&bitmap);
-                        if let Some(texture) = self.notes_texture.as_mut() {
-                            texture.set(image, TextureOptions::LINEAR);
-                        } else {
-                            self.notes_texture =
-                                Some(ctx.load_texture("notes_page", image, TextureOptions::LINEAR));
-                        }
-                        self.notes_texture_key = Some(key);
-                    }
+                Ok((key, texture)) => {
+                    self.notes_texture = Some(texture);
+                    self.notes_texture_key = Some(key);
                 }
                 Err(error) => {
                     self.open_error = Some(format!("Notes render failed: {error}"));
@@ -4193,6 +4321,22 @@ impl PresenterApp {
         self.timing_breakdown.is_open = open;
     }
 
+    fn render_performance_panel(&mut self, ctx: &Context) {
+        if !self.performance_panel_open {
+            return;
+        }
+
+        let mut open = self.performance_panel_open;
+        egui::Window::new("Performance")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                self.render_performance_controls(ui);
+            });
+        self.performance_panel_open = open;
+    }
+
     fn notes_text(&self) -> String {
         if self.document.is_none() {
             return "Load a document to show notes.".to_owned();
@@ -4219,21 +4363,28 @@ impl PresenterApp {
         layout: Option<NotesLayout>,
     ) -> Option<TextureHandle> {
         let target_width = self.config.overview_thumbnail_width;
-        let cache_key = Self::bitmap_cache_key(
+        let cache_key = Self::texture_cache_key(
             index,
             self.config.notes_mode,
             PageView::SlideOnly,
             layout,
             target_width,
+            2,
         );
 
         if self.overview_texture_keys.get(&index).copied() == Some(cache_key) {
             return self.overview_textures.get(&index).cloned();
         }
 
-        match self.get_or_render_bitmap(index, PageView::SlideOnly, layout, target_width) {
-            Ok((_, bitmap)) => {
-                let image = Self::color_image(&bitmap);
+        let Some(document) = self.document.as_ref() else {
+            return None;
+        };
+        match document.render_page_bitmap(index, PageView::SlideOnly, layout, target_width) {
+            Ok(bitmap) => {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [bitmap.width, bitmap.height],
+                    &bitmap.rgba,
+                );
                 if let Some(texture) = self.overview_textures.get_mut(&index) {
                     texture.set(image, TextureOptions::LINEAR);
                 } else {
@@ -4346,7 +4497,11 @@ impl PresenterApp {
                 });
             });
 
+        let was_open = self.deck_overview.is_open;
         self.deck_overview.is_open = open;
+        if was_open && !self.deck_overview.is_open {
+            self.clear_overview_textures();
+        }
     }
 
     fn fit_size(image_size: Vec2, available_size: Vec2) -> Vec2 {
@@ -4357,6 +4512,169 @@ impl PresenterApp {
         let sy = available_size.y / image_size.y;
         let scale = sx.min(sy).max(0.01);
         image_size * scale
+    }
+
+    fn clamp_zoom_pan_state(state: &mut ZoomPanState, texture_size: Vec2, viewport_size: Vec2) {
+        let viewport_width = viewport_size.x.max(1.0);
+        let viewport_height = viewport_size.y.max(1.0);
+        state.zoom = state.zoom.clamp(1.0, 8.0);
+
+        let fitted = Self::fit_size(texture_size, Vec2::new(viewport_width, viewport_height));
+        let scaled = fitted * state.zoom;
+        let max_pan_x = ((scaled.x - viewport_width) * 0.5).max(0.0);
+        let max_pan_y = ((scaled.y - viewport_height) * 0.5).max(0.0);
+        state.pan.x = state.pan.x.clamp(-max_pan_x, max_pan_x);
+        state.pan.y = state.pan.y.clamp(-max_pan_y, max_pan_y);
+    }
+
+    fn zoomed_image_rect(
+        texture_size: Vec2,
+        viewport_rect: Rect,
+        state: &mut ZoomPanState,
+    ) -> Rect {
+        let viewport_size = viewport_rect.size();
+        Self::clamp_zoom_pan_state(state, texture_size, viewport_size);
+        let fitted = Self::fit_size(texture_size, viewport_size);
+        let scaled = fitted * state.zoom;
+        let centered_min = viewport_rect.center() - (scaled * 0.5);
+        Rect::from_min_size(centered_min + state.pan, scaled)
+    }
+
+    fn reset_zoom_pan_state(state: &mut ZoomPanState) {
+        *state = ZoomPanState::default();
+    }
+
+    fn apply_zoom_around_anchor(
+        zoom_pan_state: &mut ZoomPanState,
+        texture_size: Vec2,
+        surface_rect: Rect,
+        image_rect: Rect,
+        anchor: Pos2,
+        new_zoom: f32,
+    ) -> Rect {
+        let old_size = image_rect.size();
+        let old_local = if old_size.x > 1.0 && old_size.y > 1.0 {
+            Vec2::new(
+                ((anchor.x - image_rect.left()) / old_size.x).clamp(0.0, 1.0),
+                ((anchor.y - image_rect.top()) / old_size.y).clamp(0.0, 1.0),
+            )
+        } else {
+            Vec2::new(0.5, 0.5)
+        };
+
+        zoom_pan_state.zoom = new_zoom.clamp(1.0, 8.0);
+        let fitted = Self::fit_size(texture_size, surface_rect.size());
+        let new_size = fitted * zoom_pan_state.zoom;
+        let centered_min = surface_rect.center() - (new_size * 0.5);
+        let desired_min = Pos2::new(
+            anchor.x - old_local.x * new_size.x,
+            anchor.y - old_local.y * new_size.y,
+        );
+        zoom_pan_state.pan = desired_min - centered_min;
+        Self::clamp_zoom_pan_state(zoom_pan_state, texture_size, surface_rect.size());
+        Self::zoomed_image_rect(texture_size, surface_rect, zoom_pan_state)
+    }
+
+    fn render_zoomable_texture_surface(
+        ui: &mut egui::Ui,
+        ctx: &Context,
+        texture: &TextureHandle,
+        viewport_size: Vec2,
+        zoom_pan_state: &mut ZoomPanState,
+    ) -> (egui::Response, Rect, bool) {
+        let safe_viewport = Vec2::new(viewport_size.x.max(1.0), viewport_size.y.max(1.0));
+        let (surface_rect, response) =
+            ui.allocate_exact_size(safe_viewport, Sense::click_and_drag());
+        let painter = ui.painter().with_clip_rect(surface_rect);
+        painter.rect_filled(surface_rect, 0.0, Color32::from_rgb(8, 10, 14));
+
+        let texture_size = texture.size_vec2();
+        let mut image_rect = Self::zoomed_image_rect(texture_size, surface_rect, zoom_pan_state);
+
+        if response.hovered() {
+            let (scroll_delta, pinch_zoom_delta, zoom_modifier_down) = ctx.input(|input| {
+                let scroll = if input.smooth_scroll_delta.length_sq() > 0.01 {
+                    input.smooth_scroll_delta
+                } else {
+                    input.raw_scroll_delta
+                };
+                let zoom_modifier = input.modifiers.ctrl || input.modifiers.command;
+                (scroll, input.zoom_delta(), zoom_modifier)
+            });
+            let anchor = response
+                .interact_pointer_pos()
+                .or_else(|| ctx.input(|input| input.pointer.hover_pos()))
+                .filter(|point| surface_rect.contains(*point))
+                .unwrap_or(surface_rect.center());
+
+            let mut zoom_applied = false;
+            if (pinch_zoom_delta - 1.0).abs() > 0.0005 {
+                let old_zoom = zoom_pan_state.zoom;
+                let new_zoom = (old_zoom * pinch_zoom_delta).clamp(1.0, 8.0);
+                if (new_zoom - old_zoom).abs() > 0.0001 {
+                    image_rect = Self::apply_zoom_around_anchor(
+                        zoom_pan_state,
+                        texture_size,
+                        surface_rect,
+                        image_rect,
+                        anchor,
+                        new_zoom,
+                    );
+                    zoom_applied = true;
+                }
+            }
+
+            if !zoom_applied && zoom_modifier_down && scroll_delta.y.abs() > 0.01 {
+                let old_zoom = zoom_pan_state.zoom;
+                let zoom_factor = (scroll_delta.y * 0.0015).exp();
+                let new_zoom = (old_zoom * zoom_factor).clamp(1.0, 8.0);
+                if (new_zoom - old_zoom).abs() > 0.0001 {
+                    image_rect = Self::apply_zoom_around_anchor(
+                        zoom_pan_state,
+                        texture_size,
+                        surface_rect,
+                        image_rect,
+                        anchor,
+                        new_zoom,
+                    );
+                    zoom_applied = true;
+                }
+            }
+
+            // Trackpad-style two-finger pan (without zoom modifiers).
+            if !zoom_applied && !zoom_modifier_down && scroll_delta.length_sq() > 0.01 {
+                zoom_pan_state.pan += scroll_delta;
+                Self::clamp_zoom_pan_state(zoom_pan_state, texture_size, surface_rect.size());
+                image_rect = Self::zoomed_image_rect(texture_size, surface_rect, zoom_pan_state);
+            }
+        }
+
+        let panning_drag = response.dragged_by(PointerButton::Secondary)
+            || response.dragged_by(PointerButton::Middle);
+        if panning_drag {
+            let drag_delta = ctx.input(|input| input.pointer.delta());
+            if drag_delta.length_sq() > 0.0 {
+                zoom_pan_state.pan += drag_delta;
+                Self::clamp_zoom_pan_state(zoom_pan_state, texture_size, surface_rect.size());
+                image_rect = Self::zoomed_image_rect(texture_size, surface_rect, zoom_pan_state);
+            }
+        }
+
+        let reset_requested = response.double_clicked_by(PointerButton::Secondary)
+            || response.double_clicked_by(PointerButton::Middle);
+        if reset_requested {
+            Self::reset_zoom_pan_state(zoom_pan_state);
+            image_rect = Self::zoomed_image_rect(texture_size, surface_rect, zoom_pan_state);
+        }
+
+        painter.image(
+            texture.id(),
+            image_rect,
+            Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
+
+        (response, image_rect, reset_requested)
     }
 
     fn render_projector_view(&mut self, ctx: &egui::Context) {
@@ -4401,39 +4719,48 @@ impl PresenterApp {
         let slide_region = Self::slide_region(displayed_layout);
         let highlight_overlay = self.highlight_overlay_snapshot_for_index(displayed_index);
         let mut projector_laser_sample: Option<LaserSurfaceSample> = None;
+        let mut projector_zoom_pan = self.projector_zoom_pan;
+        let mut projector_reset_requested = false;
         let laser_position = self.laser_position;
 
-        ctx.show_viewport_immediate(self.projector_viewport, viewport, move |ctx, _class| {
+        ctx.show_viewport_immediate(self.projector_viewport, viewport, |ctx, _class| {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(Color32::from_rgb(12, 14, 20)))
                 .show(ctx, |ui| {
                     if let Some(texture) = texture.as_ref() {
-                        let available = ui.available_size();
-                        let target = PresenterApp::fit_size(texture.size_vec2(), available);
-                        ui.centered_and_justified(|ui| {
-                            let response = ui.add(
-                                egui::Image::from_texture((texture.id(), target))
-                                    .sense(Sense::click_and_drag()),
-                            );
-                            projector_laser_sample =
-                                Some(PresenterApp::capture_laser_sample(ctx, &response));
-                            PresenterApp::draw_highlight_overlay_from_snapshot(
+                        let viewport_size = ui.available_size();
+                        let (response, image_rect, reset_requested) =
+                            PresenterApp::render_zoomable_texture_surface(
                                 ui,
-                                response.rect,
-                                slide_region,
-                                surface_space,
-                                &highlight_overlay,
-                                false,
-                                false,
+                                ctx,
+                                texture,
+                                viewport_size,
+                                &mut projector_zoom_pan,
                             );
-                            PresenterApp::draw_laser_overlay(
-                                ui,
-                                response.rect,
-                                laser_position,
-                                slide_region,
-                                surface_space,
-                            );
-                        });
+                        if reset_requested {
+                            projector_reset_requested = true;
+                        }
+                        projector_laser_sample = Some(PresenterApp::capture_laser_sample(
+                            ctx, &response, image_rect,
+                        ));
+                        PresenterApp::draw_highlight_overlay_from_snapshot(
+                            ui,
+                            image_rect,
+                            response.rect,
+                            slide_region,
+                            surface_space,
+                            &highlight_overlay,
+                            false,
+                            false,
+                        );
+                        PresenterApp::draw_laser_overlay(
+                            ui,
+                            image_rect,
+                            response.rect,
+                            laser_position,
+                            slide_region,
+                            surface_space,
+                        );
                     } else {
                         ui.vertical_centered(|ui| {
                             ui.add_space(40.0);
@@ -4471,8 +4798,25 @@ impl PresenterApp {
                             Color32::from_rgb(255, 220, 220),
                         );
                     }
+                    if projector_zoom_pan.zoom > 1.001 {
+                        let zoom_rect = Rect::from_min_size(
+                            ui.min_rect().min + Vec2::new(12.0, 72.0),
+                            Vec2::new(108.0, 24.0),
+                        );
+                        PresenterApp::draw_badge(
+                            ui,
+                            zoom_rect,
+                            &format!("ZOOM {:.0}%", projector_zoom_pan.zoom * 100.0),
+                            Color32::from_rgba_unmultiplied(20, 20, 20, 210),
+                            Color32::from_rgb(210, 230, 255),
+                        );
+                    }
                 });
         });
+        self.projector_zoom_pan = projector_zoom_pan;
+        if projector_reset_requested {
+            self.status_message = Some("Projector view reset.".to_owned());
+        }
 
         if let Some(sample) = projector_laser_sample {
             self.consume_laser_sample(sample, slide_region, surface_space);
@@ -4543,6 +4887,13 @@ impl PresenterApp {
                 }
                 if ui.button("Timing (B)").clicked() {
                     self.timing_breakdown.toggle();
+                }
+                if ui.button("Reset Zoom/Pan").clicked() {
+                    Self::reset_zoom_pan_state(&mut self.presenter_zoom_pan);
+                    Self::reset_zoom_pan_state(&mut self.projector_zoom_pan);
+                }
+                if ui.button("Performance").clicked() {
+                    self.performance_panel_open = true;
                 }
             });
         });
@@ -4718,23 +5069,32 @@ impl PresenterApp {
                         ui.group(|ui| {
                             ui.heading("Current slide");
                             if let Some(texture) = self.current_texture.as_ref() {
-                                let max = Vec2::new(ui.available_width(), preview_height);
-                                let target = Self::fit_size(texture.size_vec2(), max);
-                                let response = ui.add(
-                                    egui::Image::from_texture((texture.id(), target))
-                                        .sense(Sense::click_and_drag()),
-                                );
+                                let viewport_size = Vec2::new(ui.available_width(), preview_height);
+                                let (response, image_rect, reset_requested) =
+                                    Self::render_zoomable_texture_surface(
+                                        ui,
+                                        ctx,
+                                        texture,
+                                        viewport_size,
+                                        &mut self.presenter_zoom_pan,
+                                    );
+                                if reset_requested {
+                                    self.status_message = Some("Presenter view reset.".to_owned());
+                                }
                                 self.handle_current_slide_interaction(
                                     &response,
+                                    image_rect,
                                     display_index,
                                     display_layout,
                                 );
                                 self.handle_annotation_interaction(
                                     &response,
+                                    image_rect,
                                     display_index,
                                     display_layout,
                                 );
-                                let laser_sample = Self::capture_laser_sample(ctx, &response);
+                                let laser_sample =
+                                    Self::capture_laser_sample(ctx, &response, image_rect);
                                 self.consume_laser_sample(
                                     laser_sample,
                                     Self::slide_region(display_layout),
@@ -4742,19 +5102,25 @@ impl PresenterApp {
                                 );
                                 self.draw_annotation_overlays(
                                     ui,
+                                    image_rect,
                                     response.rect,
                                     display_index,
                                     display_layout,
                                 );
-                                self.render_quick_actions_overlay(ui, response.rect, display_index);
-                                self.draw_unsaved_badge_on_preview(ui, response.rect);
+                                self.render_quick_actions_overlay(ui, image_rect, display_index);
+                                self.draw_unsaved_badge_on_preview(ui, image_rect);
                                 Self::draw_laser_overlay(
                                     ui,
+                                    image_rect,
                                     response.rect,
                                     self.laser_position,
                                     Self::slide_region(display_layout),
                                     SlideSurfaceSpace::CroppedSlide,
                                 );
+                                ui.small(format!(
+                                    "Zoom {:.0}% | Pinch or Ctrl/Cmd+Wheel zoom | Two-finger scroll or Right/Middle drag pan | Double right-click reset",
+                                    self.presenter_zoom_pan.zoom * 100.0
+                                ));
                             } else {
                                 ui.label("No rendered current slide.");
                             }
@@ -5132,7 +5498,7 @@ impl PresenterApp {
                         });
                         ui.add_space(6.0);
                         self.render_keybindings_editor(ui);
-                        });
+                    });
                     },
                 );
             });
@@ -5224,6 +5590,7 @@ impl PresenterApp {
                     self.config.overview_columns = self.config.overview_columns.clamp(2, 8);
                     self.persist_config();
                 }
+
             });
 
             ui.horizontal(|ui| {
@@ -5361,12 +5728,14 @@ impl PresenterApp {
 
         self.render_deck_overview(ctx);
         self.render_timing_breakdown(ctx);
+        self.render_performance_panel(ctx);
     }
 
     fn apply_overview_commit(&mut self) {
         if let Some(target) = self.deck_overview.take_commit() {
             self.apply_command(AppCommand::GoToIndex(target));
             self.deck_overview.selected_index = self.state.current_index();
+            self.clear_overview_textures();
         }
     }
 }
@@ -5412,12 +5781,12 @@ impl eframe::App for PresenterApp {
 mod overview_tests {
     use super::{
         DeckOverviewState, PresenterApp, ResizeHandle, ShortcutAction, ShortcutBindings,
-        SlideSurfaceSpace, TimingBreakdownRow, TimingBreakdownState, TransformMode,
+        SlideSurfaceSpace, TimingBreakdownRow, TimingBreakdownState, TransformMode, ZoomPanState,
     };
     use crate::app::{AppCommand, PresentationState};
     use crate::config::{KeybindingConfig, NotesLayout, NotesSide, SplitAxis};
     use crate::document::{AnnotationMetadata, PdfRect, TextAnnotation};
-    use eframe::egui::{Key, Pos2, Rect};
+    use eframe::egui::{Key, Pos2, Rect, Vec2};
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
 
@@ -5545,6 +5914,36 @@ mod overview_tests {
         let (temp_next, visible) = PresenterApp::finalize_laser_state(false, false, true, false);
         assert!(!temp_next);
         assert!(!visible);
+    }
+
+    #[test]
+    fn zoom_pan_clamps_pan_to_visible_bounds() {
+        let mut zoom_pan = ZoomPanState {
+            zoom: 2.0,
+            pan: Vec2::new(9999.0, -9999.0),
+        };
+        PresenterApp::clamp_zoom_pan_state(
+            &mut zoom_pan,
+            Vec2::new(1920.0, 1080.0),
+            Vec2::new(800.0, 450.0),
+        );
+        let fitted = PresenterApp::fit_size(Vec2::new(1920.0, 1080.0), Vec2::new(800.0, 450.0));
+        let scaled = fitted * zoom_pan.zoom;
+        let max_pan_x = ((scaled.x - 800.0) * 0.5).max(0.0);
+        let max_pan_y = ((scaled.y - 450.0) * 0.5).max(0.0);
+        assert!(zoom_pan.pan.x.abs() <= max_pan_x + 0.001);
+        assert!(zoom_pan.pan.y.abs() <= max_pan_y + 0.001);
+    }
+
+    #[test]
+    fn zoomed_image_rect_respects_center_when_zoom_is_one() {
+        let viewport = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(1000.0, 700.0));
+        let mut zoom_pan = ZoomPanState::default();
+        let rect =
+            PresenterApp::zoomed_image_rect(Vec2::new(1920.0, 1080.0), viewport, &mut zoom_pan);
+        assert!((rect.center().x - viewport.center().x).abs() < 0.01);
+        assert!((rect.center().y - viewport.center().y).abs() < 0.01);
+        assert!((zoom_pan.zoom - 1.0).abs() < 0.001);
     }
 
     #[test]
