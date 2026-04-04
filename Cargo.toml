@@ -3,4 +3,26 @@ name = "PDF-Presenter"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "pdf_presenter"
+path = "src/lib.rs"
+
+[[bin]]
+name = "decklight"
+path = "src/main.rs"
+
 [dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+directories = "6.0"
+eframe = { version = "0.33", default-features = true }
+egui = "0.33"
+lopdf = "0.38"
+lru = "0.16"
+pdfium-auto = "0.3"
+pdfium-render = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.9"
+
+[dev-dependencies]
+tempfile = "3.23"

@@ -1,0 +1,21 @@
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppCommand {
+    NextSlide,
+    PreviousSlide,
+    FirstSlide,
+    LastSlide,
+    GoToIndex(usize),
+    GoToLabel(String),
+    ToggleLabelMode,
+    SwapScreens,
+    ToggleProjectorFullscreen,
+    ToggleLaser,
+    ToggleHighlight,
+    ToggleAutoAdvance,
+    SetAutoAdvanceEnabled(bool),
+    SetAutoAdvanceGlobalInterval(u32),
+    SetAutoAdvanceSlideOverride { index: usize, secs: u32 },
+    ClearAutoAdvanceSlideOverride(usize),
+    StartTimer,
+    ResetTimer,
+}
