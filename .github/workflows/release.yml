@@ -25,18 +25,18 @@ jobs:
             target: x86_64-pc-windows-msvc
             bin: decklight.exe
             asset: decklight-windows-x86_64.exe
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             bin: decklight
             asset: decklight-macos-x86_64
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             bin: decklight
             asset: decklight-macos-aarch64
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -53,7 +53,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "release-assets/${{ matrix.asset }}"
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.asset }}
           path: release-assets/${{ matrix.asset }}
@@ -64,7 +64,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: release-assets
           merge-multiple: true
