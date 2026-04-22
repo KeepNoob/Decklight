@@ -2,6 +2,7 @@
 name = "PDF-Presenter"
 version = "0.1.0"
 edition = "2024"
+description = "Dual-screen PDF presentation app"
 
 [lib]
 name = "pdf_presenter"
@@ -33,3 +34,22 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+[package.metadata.packager]
+product-name = "Decklight"
+identifier = "com.decklight.app"
+publisher = "Decklight"
+description = "Dual-screen PDF presentation app"
+long-description = """
+Decklight is a dual-screen PDF presentation app written in Rust. It provides
+presenter and projector views together with annotation and timing tools.
+"""
+category = "Productivity"
+icons = ["assets/icons/*.png"]
+before-packaging-command = "cargo build --release --bin decklight"
+out-dir = "dist"
+binaries-dir = "target/release"
+
+[[package.metadata.packager.binaries]]
+path = "decklight"
+main = true
