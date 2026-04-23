@@ -17,6 +17,15 @@ pub enum NotesMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+pub enum AppTheme {
+    #[default]
+    Dark,
+    Light,
+    ProjectorSafe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 pub enum SplitAxis {
     #[default]
     Vertical,
@@ -268,6 +277,7 @@ impl AutoAdvanceDocumentConfig {
 #[serde(default)]
 pub struct AppConfig {
     pub config_version: u16,
+    pub theme: AppTheme,
     pub cache_size: usize,
     pub cache_budget_mb: usize,
     pub projector_render_width: usize,
@@ -291,6 +301,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             config_version: 4,
+            theme: AppTheme::Dark,
             cache_size: 200,
             cache_budget_mb: 768,
             projector_render_width: 1920,
@@ -377,7 +388,7 @@ impl AppConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, KeybindingConfig};
+    use super::{AppConfig, AppTheme, KeybindingConfig};
     use tempfile::tempdir;
 
     #[test]
@@ -445,6 +456,7 @@ global_interval_secs = 99999
         let loaded = AppConfig::load_from_path(&path).expect("load config");
 
         assert_eq!(loaded.cache_size, 1);
+        assert_eq!(loaded.theme, AppTheme::Dark);
         assert_eq!(loaded.cache_budget_mb, 64);
         assert_eq!(loaded.projector_render_width, 640);
         assert_eq!(loaded.presenter_render_width, 4096);

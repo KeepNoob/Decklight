@@ -87,6 +87,14 @@ impl<T: CacheWeight> PageCache<T> {
         self.current_weight_bytes = self.current_weight_bytes.saturating_add(incoming_weight);
     }
 
+    pub fn remove(&mut self, key: usize) -> Option<T> {
+        let removed = self.cache.pop(&key)?;
+        self.current_weight_bytes = self
+            .current_weight_bytes
+            .saturating_sub(removed.cache_weight_bytes());
+        Some(removed)
+    }
+
     pub fn resize(&mut self, capacity: usize) {
         let safe_capacity = NonZeroUsize::new(capacity.max(1)).expect("non-zero cache capacity");
         self.cache.resize(safe_capacity);
@@ -140,5 +148,17 @@ mod tests {
         assert!(cache.total_weight_bytes() <= 5);
         assert!(!cache.contains(1));
         assert!(cache.contains(2) || cache.contains(3));
+    }
+
+    #[test]
+    fn remove_updates_weight() {
+        let mut cache = PageCache::new(4, 1024);
+        cache.put(1, "abc");
+        cache.put(2, "de");
+
+        assert_eq!(cache.total_weight_bytes(), 5);
+        assert_eq!(cache.remove(1), Some("abc"));
+        assert_eq!(cache.total_weight_bytes(), 2);
+        assert!(!cache.contains(1));
     }
 }

@@ -1,13 +1,34 @@
 mod command;
+mod interaction;
+mod overview;
+mod presenter;
+mod render_cache;
+mod render_worker;
+mod shortcuts;
 mod state;
+mod theme;
+mod timing;
 
 pub use command::AppCommand;
 pub use state::PresentationState;
 
-use crate::cache::{CacheWeight, PageCache};
+use self::interaction::{
+    ActiveTextTransform, HighlightOverlaySnapshot, HighlightOverlaySurface, HighlightTool,
+    InteractionMode, LaserSurfaceSample, PenStrokeStyle, PendingUnsavedAction, ResizeHandle,
+    SessionInkStroke, SlideRegion, SlideSurfaceSpace, TransformMode, ZoomPanState,
+};
+use self::overview::DeckOverviewState;
+use self::presenter::{CachedResolvedLayout, PresenterApp};
+use self::render_cache::CachedTexture;
+use self::render_worker::{RenderJob, RenderJobKey, RenderPriority, RenderResult, RenderWorker};
+use self::shortcuts::{ShortcutAction, ShortcutBindings};
+use self::theme::{ThemePalette, card_frame, inset_frame, install_visual_style, quiet_label};
+use self::theme::{pill_text, section_title, status_pill, theme_label};
+use self::timing::{TimingBreakdownModel, TimingBreakdownRow, TimingBreakdownState};
+use crate::cache::PageCache;
 use crate::config::{
-    AppConfig, AutoAdvanceDocumentConfig, KeybindingConfig, NotesLayout, NotesLayoutOverrideConfig,
-    NotesMode, NotesSide, PenPreset, SplitAxis,
+    AppConfig, AppTheme, AutoAdvanceDocumentConfig, KeybindingConfig, NotesLayout,
+    NotesLayoutOverrideConfig, NotesMode, NotesSide, PenPreset, SplitAxis,
 };
 use crate::document::{
     AnnotationMetadata, AnnotationPriority, AnnotationStatus, DocumentBackend, NewInkAnnotation,
@@ -23,6 +44,38 @@ use eframe::egui::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Copy)]
+enum SecondaryTextureSlot {
+    Presenter,
+    Notes,
+    Next,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CriticalTextureSlot {
+    Projector,
+    Current,
+}
+
+#[derive(Clone)]
+struct ProgressiveTexture {
+    target_key: usize,
+    texture_key: Option<usize>,
+    texture: Option<TextureHandle>,
+    is_low_res: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BackgroundRenderRequest {
+    cache_key: usize,
+    index: usize,
+    view: PageView,
+    layout: Option<NotesLayout>,
+    target_width: usize,
+    namespace: usize,
+    priority: RenderPriority,
+}
 
 pub fn run(initial_source: Option<PathBuf>) -> Result<()> {
     let (config, config_path) = AppConfig::load_or_create()?;
@@ -48,623 +101,27 @@ pub fn run(initial_source: Option<PathBuf>) -> Result<()> {
         .map_err(|error| anyhow!(error.to_string()))
 }
 
-struct PresenterApp {
-    config: AppConfig,
-    config_path: PathBuf,
-    state: PresentationState,
-    document: Option<Box<dyn DocumentBackend>>,
-    source_path_input: String,
-    go_to_input: String,
-    open_error: Option<String>,
-    status_message: Option<String>,
-    last_reload_check: Instant,
-    projector_viewport: ViewportId,
-    texture_cache: PageCache<CachedTexture>,
-    projector_texture: Option<TextureHandle>,
-    projector_texture_key: Option<usize>,
-    projector_zoom_pan: ZoomPanState,
-    current_texture: Option<TextureHandle>,
-    current_texture_key: Option<usize>,
-    presenter_zoom_pan: ZoomPanState,
-    presenter_texture: Option<TextureHandle>,
-    presenter_texture_key: Option<usize>,
-    notes_texture: Option<TextureHandle>,
-    notes_texture_key: Option<usize>,
-    next_texture: Option<TextureHandle>,
-    next_texture_key: Option<usize>,
-    current_document_fingerprint: Option<String>,
-    manual_layout_override: NotesLayoutOverrideConfig,
-    resolved_layout: Option<NotesLayout>,
-    resolved_layout_key: Option<usize>,
-    layout_reason: Option<String>,
-    layout_warning: Option<String>,
-    deck_overview: DeckOverviewState,
-    overview_textures: BTreeMap<usize, TextureHandle>,
-    overview_texture_keys: BTreeMap<usize, usize>,
-    annotation_edit_enabled: bool,
-    pending_text_annotation: String,
-    text_annotations: Vec<TextAnnotation>,
-    original_text_annotations: BTreeMap<String, TextAnnotation>,
-    text_annotation_cache_index: Option<usize>,
-    selected_annotation_id: Option<String>,
-    active_text_transform: Option<ActiveTextTransform>,
-    stroke_in_progress: Vec<(f32, f32)>,
-    stroke_in_progress_style: Option<PenStrokeStyle>,
-    lasso_path_in_progress: Vec<(f32, f32)>,
-    selected_stroke_ids: BTreeSet<String>,
-    active_highlight_tool: HighlightTool,
-    unsaved_strokes: BTreeMap<usize, Vec<SessionInkStroke>>,
-    stroke_undo_stack: BTreeMap<usize, Vec<SessionInkStroke>>,
-    eraser_erased_in_drag: BTreeSet<String>,
-    eraser_removed_this_drag: bool,
-    laser_position: Option<(f32, f32)>,
-    temporary_laser_active: bool,
-    laser_persistent_seen_this_frame: bool,
-    laser_primary_down_seen_this_frame: bool,
-    auto_override_editor_secs: u32,
-    auto_override_editor_index: Option<usize>,
-    timing_breakdown: TimingBreakdownState,
-    performance_panel_open: bool,
-    shortcut_bindings: ShortcutBindings,
-    keybinding_editor: BTreeMap<String, String>,
-    keybinding_editor_dirty: bool,
-    keybinding_warning: Option<String>,
-    unsaved_toast_until: Option<Instant>,
-    unsaved_toast_text: Option<String>,
-    non_highlight_unsaved_changes: bool,
-    pending_unsaved_action: Option<PendingUnsavedAction>,
-    allow_close_without_guard: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InteractionMode {
-    Navigate,
-    HighlightDraw,
-    AnnotationEdit,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HighlightTool {
-    Draw,
-    Eraser,
-    Lasso,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SlideRegion {
-    min_x: f32,
-    max_x: f32,
-    min_y: f32,
-    max_y: f32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SlideSurfaceSpace {
-    FullPage,
-    CroppedSlide,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct LaserSurfaceSample {
-    surface_rect: Rect,
-    pointer_pos: Option<Pos2>,
-    ctrl_down: bool,
-    primary_down: bool,
-    hovered: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ZoomPanState {
-    zoom: f32,
-    pan: Vec2,
-}
-
-impl Default for ZoomPanState {
-    fn default() -> Self {
-        Self {
-            zoom: 1.0,
-            pan: Vec2::ZERO,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResizeHandle {
-    NorthWest,
-    NorthEast,
-    SouthWest,
-    SouthEast,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum TransformMode {
-    Move,
-    Resize(ResizeHandle),
-}
-
-#[derive(Debug, Clone)]
-struct ActiveTextTransform {
-    annotation_id: String,
-    start_pointer: (f32, f32),
-    start_rect: PdfRect,
-    mode: TransformMode,
-}
-
-#[derive(Debug, Clone)]
-struct SessionInkStroke {
-    annotation_id: String,
-    points: Vec<(f32, f32)>,
-    color_rgb: (f32, f32, f32),
-    width: f32,
-    opacity: f32,
-}
-
-#[derive(Clone)]
-struct CachedTexture {
-    texture: TextureHandle,
-    byte_estimate: usize,
-}
-
-impl CacheWeight for CachedTexture {
-    fn cache_weight_bytes(&self) -> usize {
-        self.byte_estimate
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PenStrokeStyle {
-    color_rgb: (f32, f32, f32),
-    width: f32,
-    opacity: f32,
-}
-
-#[derive(Debug, Clone)]
-struct HighlightOverlaySnapshot {
-    strokes: Vec<SessionInkStroke>,
-    selected_stroke_ids: BTreeSet<String>,
-    stroke_in_progress: Vec<(f32, f32)>,
-    stroke_in_progress_style: Option<PenStrokeStyle>,
-    active_highlight_tool: HighlightTool,
-    lasso_path_in_progress: Vec<(f32, f32)>,
-}
-
-#[derive(Debug, Clone)]
-enum PendingUnsavedAction {
-    Load(PathBuf),
-    Close,
-}
-
-#[derive(Debug, Clone)]
-struct DeckOverviewState {
-    is_open: bool,
-    selected_index: usize,
-    thumbnail_scale: f32,
-    commit_pending: Option<usize>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct TimingBreakdownState {
-    is_open: bool,
-}
-
-impl TimingBreakdownState {
-    fn toggle(&mut self) {
-        self.is_open = !self.is_open;
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum TimingBreakdownRow {
-    SectionTotal {
-        depth: usize,
-        title: String,
-        duration: Duration,
-    },
-    Slide {
-        depth: usize,
-        index: usize,
-        label: String,
-        duration: Duration,
-        is_current: bool,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TimingBreakdownModel {
-    total: Duration,
-    has_sections: bool,
-    rows: Vec<TimingBreakdownRow>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum ShortcutAction {
-    ToggleDeckOverview,
-    ToggleTimingBreakdown,
-    Next,
-    NextPageDown,
-    NextSpace,
-    Previous,
-    PreviousPageUp,
-    First,
-    Last,
-    SwapScreens,
-    ToggleLabelMode,
-    ToggleLaser,
-    ToggleAutoAdvance,
-    ToggleHighlight,
-    ToggleAnnotationEdit,
-    ToggleProjectorFullscreen,
-    ResetTimer,
-    GoTo,
-    OverviewCancel,
-    OverviewCommit,
-    OverviewUp,
-    OverviewDown,
-    UndoStroke,
-    RedoStroke,
-    ClearCurrentStroke,
-    ClearSlideHighlights,
-    DuplicateSelectedNote,
-    DeleteSelectedNote,
-    ApplyTransform,
-    RevertTransform,
-    PreviousPenPreset,
-    NextPenPreset,
-    ToggleEraser,
-    ToggleLassoSelect,
-    DeleteSelectedStrokes,
-    ApplyPresetToSelectedStrokes,
-}
-
-impl ShortcutAction {
-    const ALL: [Self; 36] = [
-        Self::ToggleDeckOverview,
-        Self::ToggleTimingBreakdown,
-        Self::Next,
-        Self::NextPageDown,
-        Self::NextSpace,
-        Self::Previous,
-        Self::PreviousPageUp,
-        Self::First,
-        Self::Last,
-        Self::SwapScreens,
-        Self::ToggleLabelMode,
-        Self::ToggleLaser,
-        Self::ToggleAutoAdvance,
-        Self::ToggleHighlight,
-        Self::ToggleAnnotationEdit,
-        Self::ToggleProjectorFullscreen,
-        Self::ResetTimer,
-        Self::GoTo,
-        Self::OverviewCancel,
-        Self::OverviewCommit,
-        Self::OverviewUp,
-        Self::OverviewDown,
-        Self::UndoStroke,
-        Self::RedoStroke,
-        Self::ClearCurrentStroke,
-        Self::ClearSlideHighlights,
-        Self::DuplicateSelectedNote,
-        Self::DeleteSelectedNote,
-        Self::ApplyTransform,
-        Self::RevertTransform,
-        Self::PreviousPenPreset,
-        Self::NextPenPreset,
-        Self::ToggleEraser,
-        Self::ToggleLassoSelect,
-        Self::DeleteSelectedStrokes,
-        Self::ApplyPresetToSelectedStrokes,
-    ];
-
-    fn id(self) -> &'static str {
-        match self {
-            Self::ToggleDeckOverview => "toggle_deck_overview",
-            Self::ToggleTimingBreakdown => "toggle_timing_breakdown",
-            Self::Next => "next",
-            Self::NextPageDown => "next_page_down",
-            Self::NextSpace => "next_space",
-            Self::Previous => "prev",
-            Self::PreviousPageUp => "prev_page_up",
-            Self::First => "first",
-            Self::Last => "last",
-            Self::SwapScreens => "swap_screens",
-            Self::ToggleLabelMode => "toggle_label_mode",
-            Self::ToggleLaser => "toggle_laser",
-            Self::ToggleAutoAdvance => "toggle_auto_advance",
-            Self::ToggleHighlight => "toggle_highlight",
-            Self::ToggleAnnotationEdit => "toggle_annotation_edit",
-            Self::ToggleProjectorFullscreen => "toggle_projector_fullscreen",
-            Self::ResetTimer => "reset_timer",
-            Self::GoTo => "goto",
-            Self::OverviewCancel => "overview_cancel",
-            Self::OverviewCommit => "overview_commit",
-            Self::OverviewUp => "overview_up",
-            Self::OverviewDown => "overview_down",
-            Self::UndoStroke => "undo_stroke",
-            Self::RedoStroke => "redo_stroke",
-            Self::ClearCurrentStroke => "clear_current_stroke",
-            Self::ClearSlideHighlights => "clear_slide_highlights",
-            Self::DuplicateSelectedNote => "duplicate_selected_note",
-            Self::DeleteSelectedNote => "delete_selected_note",
-            Self::ApplyTransform => "apply_transform",
-            Self::RevertTransform => "revert_transform",
-            Self::PreviousPenPreset => "prev_pen_preset",
-            Self::NextPenPreset => "next_pen_preset",
-            Self::ToggleEraser => "toggle_eraser",
-            Self::ToggleLassoSelect => "toggle_lasso_select",
-            Self::DeleteSelectedStrokes => "delete_selected_strokes",
-            Self::ApplyPresetToSelectedStrokes => "apply_preset_to_selected_strokes",
-        }
-    }
-
-    fn title(self) -> &'static str {
-        match self {
-            Self::ToggleDeckOverview => "Deck Overview Toggle",
-            Self::ToggleTimingBreakdown => "Timing Breakdown Toggle",
-            Self::Next => "Next Slide",
-            Self::NextPageDown => "Next (PageDown)",
-            Self::NextSpace => "Next (Space)",
-            Self::Previous => "Previous Slide",
-            Self::PreviousPageUp => "Previous (PageUp)",
-            Self::First => "First Slide",
-            Self::Last => "Last Slide",
-            Self::SwapScreens => "Swap Screens",
-            Self::ToggleLabelMode => "Toggle Label Mode",
-            Self::ToggleLaser => "Toggle Laser",
-            Self::ToggleAutoAdvance => "Toggle Auto-Advance",
-            Self::ToggleHighlight => "Toggle Highlight",
-            Self::ToggleAnnotationEdit => "Toggle Annotation Edit",
-            Self::ToggleProjectorFullscreen => "Toggle Projector Fullscreen",
-            Self::ResetTimer => "Reset Timer",
-            Self::GoTo => "Go To",
-            Self::OverviewCancel => "Overview Cancel",
-            Self::OverviewCommit => "Overview Commit",
-            Self::OverviewUp => "Overview Up",
-            Self::OverviewDown => "Overview Down",
-            Self::UndoStroke => "Undo Stroke",
-            Self::RedoStroke => "Redo Stroke",
-            Self::ClearCurrentStroke => "Clear Current Stroke",
-            Self::ClearSlideHighlights => "Clear Slide Highlights",
-            Self::DuplicateSelectedNote => "Duplicate Selected Note",
-            Self::DeleteSelectedNote => "Delete Selected Note",
-            Self::ApplyTransform => "Apply Transform",
-            Self::RevertTransform => "Revert Transform",
-            Self::PreviousPenPreset => "Previous Pen Preset",
-            Self::NextPenPreset => "Next Pen Preset",
-            Self::ToggleEraser => "Toggle Eraser",
-            Self::ToggleLassoSelect => "Toggle Lasso Select",
-            Self::DeleteSelectedStrokes => "Delete Selected Strokes",
-            Self::ApplyPresetToSelectedStrokes => "Apply Preset To Selected Strokes",
-        }
-    }
-
-    fn default_key(self) -> Key {
-        match self {
-            Self::ToggleDeckOverview => Key::D,
-            Self::ToggleTimingBreakdown => Key::B,
-            Self::Next => Key::ArrowRight,
-            Self::NextPageDown => Key::PageDown,
-            Self::NextSpace => Key::Space,
-            Self::Previous => Key::ArrowLeft,
-            Self::PreviousPageUp => Key::PageUp,
-            Self::First => Key::Home,
-            Self::Last => Key::End,
-            Self::SwapScreens => Key::S,
-            Self::ToggleLabelMode => Key::J,
-            Self::ToggleLaser => Key::L,
-            Self::ToggleAutoAdvance => Key::T,
-            Self::ToggleHighlight => Key::H,
-            Self::ToggleAnnotationEdit => Key::A,
-            Self::ToggleProjectorFullscreen => Key::F,
-            Self::ResetTimer => Key::R,
-            Self::GoTo => Key::G,
-            Self::OverviewCancel => Key::Escape,
-            Self::OverviewCommit => Key::Enter,
-            Self::OverviewUp => Key::ArrowUp,
-            Self::OverviewDown => Key::ArrowDown,
-            Self::UndoStroke => Key::U,
-            Self::RedoStroke => Key::Y,
-            Self::ClearCurrentStroke => Key::X,
-            Self::ClearSlideHighlights => Key::C,
-            Self::DuplicateSelectedNote => Key::N,
-            Self::DeleteSelectedNote => Key::Backspace,
-            Self::ApplyTransform => Key::P,
-            Self::RevertTransform => Key::V,
-            Self::PreviousPenPreset => Key::Q,
-            Self::NextPenPreset => Key::W,
-            Self::ToggleEraser => Key::E,
-            Self::ToggleLassoSelect => Key::M,
-            Self::DeleteSelectedStrokes => Key::Delete,
-            Self::ApplyPresetToSelectedStrokes => Key::K,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct ShortcutBindings {
-    action_to_key: BTreeMap<ShortcutAction, Key>,
-}
-
-impl ShortcutBindings {
-    fn from_config(config: &KeybindingConfig) -> (Self, Vec<String>) {
-        let mut bindings = Self {
-            action_to_key: BTreeMap::new(),
-        };
-        let mut warnings = Vec::new();
-        let mut used_keys: BTreeMap<Key, ShortcutAction> = BTreeMap::new();
-
-        let known_ids: BTreeSet<&'static str> = ShortcutAction::ALL
-            .into_iter()
-            .map(ShortcutAction::id)
-            .collect();
-        for configured in config.bindings.keys() {
-            if !known_ids.contains(configured.as_str()) {
-                warnings.push(format!("Unknown shortcut action '{configured}' ignored."));
-            }
-        }
-
-        for action in ShortcutAction::ALL {
-            let configured = config.bindings.get(action.id()).map(String::as_str);
-            let parsed_configured = match configured {
-                Some(raw) => match Self::parse_single_key(raw) {
-                    Some(key) => Some(key),
-                    None => {
-                        warnings.push(format!(
-                            "Invalid key '{}' for '{}'; using default '{}'.",
-                            raw,
-                            action.id(),
-                            action.default_key().name()
-                        ));
-                        None
-                    }
-                },
-                None => None,
-            };
-
-            let preferred_key = parsed_configured.unwrap_or_else(|| action.default_key());
-            let mut final_key = preferred_key;
-
-            if let Some(existing_action) = used_keys.get(&preferred_key).copied() {
-                if preferred_key != action.default_key() {
-                    let fallback = action.default_key();
-                    if used_keys.contains_key(&fallback) {
-                        warnings.push(format!(
-                            "Key '{}' for '{}' conflicts with '{}'; action left unbound.",
-                            preferred_key.name(),
-                            action.id(),
-                            existing_action.id()
-                        ));
-                        continue;
-                    }
-                    warnings.push(format!(
-                        "Key '{}' for '{}' conflicts with '{}'; falling back to '{}'.",
-                        preferred_key.name(),
-                        action.id(),
-                        existing_action.id(),
-                        fallback.name()
-                    ));
-                    final_key = fallback;
-                } else {
-                    warnings.push(format!(
-                        "Key '{}' for '{}' conflicts with '{}'; action left unbound.",
-                        preferred_key.name(),
-                        action.id(),
-                        existing_action.id()
-                    ));
-                    continue;
-                }
-            }
-
-            used_keys.insert(final_key, action);
-            bindings.action_to_key.insert(action, final_key);
-        }
-
-        (bindings, warnings)
-    }
-
-    fn parse_single_key(raw: &str) -> Option<Key> {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        if lower.contains("ctrl")
-            || lower.contains("shift")
-            || lower.contains("alt")
-            || lower.contains("cmd")
-            || trimmed.contains('+')
-        {
-            return None;
-        }
-        Key::from_name(trimmed)
-    }
-
-    fn key_for(&self, action: ShortcutAction) -> Option<Key> {
-        self.action_to_key.get(&action).copied()
-    }
-}
-
-impl Default for DeckOverviewState {
-    fn default() -> Self {
-        Self {
-            is_open: false,
-            selected_index: 0,
-            thumbnail_scale: 1.0,
-            commit_pending: None,
-        }
-    }
-}
-
-impl DeckOverviewState {
-    fn open(&mut self, current_index: usize) {
-        self.is_open = true;
-        self.selected_index = current_index;
-    }
-
-    fn toggle(&mut self, current_index: usize) {
-        if self.is_open {
-            self.is_open = false;
-        } else {
-            self.open(current_index);
-        }
-    }
-
-    fn cancel(&mut self) {
-        self.is_open = false;
-        self.commit_pending = None;
-    }
-
-    fn move_selection(
-        &mut self,
-        total_slides: usize,
-        columns: usize,
-        delta_col: i32,
-        delta_row: i32,
-    ) {
-        if total_slides == 0 {
-            self.selected_index = 0;
-            return;
-        }
-        let cols = columns.max(1);
-        let mut row = self.selected_index / cols;
-        let mut col = self.selected_index % cols;
-
-        if delta_col < 0 {
-            col = col.saturating_sub(delta_col.unsigned_abs() as usize);
-        } else if delta_col > 0 {
-            col = col.saturating_add(delta_col as usize);
-        }
-
-        if delta_row < 0 {
-            row = row.saturating_sub(delta_row.unsigned_abs() as usize);
-        } else if delta_row > 0 {
-            row = row.saturating_add(delta_row as usize);
-        }
-
-        let mut next = row.saturating_mul(cols).saturating_add(col);
-        if next >= total_slides {
-            next = total_slides - 1;
-        }
-        self.selected_index = next;
-    }
-
-    fn commit(&mut self) {
-        self.commit_pending = Some(self.selected_index);
-        self.is_open = false;
-    }
-
-    fn take_commit(&mut self) -> Option<usize> {
-        self.commit_pending.take()
-    }
-}
-
 impl PresenterApp {
+    fn palette(&self) -> ThemePalette {
+        ThemePalette::for_theme(self.config.theme)
+    }
+
+    fn card_frame(&self) -> egui::Frame {
+        card_frame(self.config.theme)
+    }
+
+    fn inset_frame(&self) -> egui::Frame {
+        inset_frame(self.config.theme)
+    }
+
     fn new(
-        _cc: &eframe::CreationContext<'_>,
+        cc: &eframe::CreationContext<'_>,
         config: AppConfig,
         config_path: PathBuf,
         initial_source: Option<PathBuf>,
     ) -> Self {
+        install_visual_style(&cc.egui_ctx, config.theme);
+
         let now = Instant::now();
         let auto_default_interval = config.auto_advance_default_interval_secs;
         let initial_highlight_tool = if config.pen_toolkit.eraser_enabled {
@@ -688,28 +145,41 @@ impl PresenterApp {
             open_error: None,
             status_message: Some("Ready. Enter a PDF path and click Load.".to_owned()),
             last_reload_check: now,
+            non_critical_texture_refresh_after: None,
+            render_worker: RenderWorker::start(),
+            render_document_generation: 0,
             projector_viewport: ViewportId::from_hash_of("projector_window"),
             projector_texture: None,
             projector_texture_key: None,
+            projector_low_res_texture_key: None,
             projector_zoom_pan: ZoomPanState::default(),
             current_texture: None,
             current_texture_key: None,
+            current_low_res_texture_key: None,
             presenter_zoom_pan: ZoomPanState::default(),
             presenter_texture: None,
             presenter_texture_key: None,
+            presenter_texture_pending: false,
+            presenter_texture_low_res: false,
+            presenter_low_res_texture_key: None,
             notes_texture: None,
             notes_texture_key: None,
+            notes_texture_pending: false,
+            notes_texture_low_res: false,
+            notes_low_res_texture_key: None,
             next_texture: None,
             next_texture_key: None,
+            next_texture_pending: false,
+            next_texture_low_res: false,
+            next_low_res_texture_key: None,
             current_document_fingerprint: None,
             manual_layout_override: NotesLayoutOverrideConfig::default(),
             resolved_layout: None,
             resolved_layout_key: None,
+            resolved_layout_cache: BTreeMap::new(),
             layout_reason: None,
             layout_warning: None,
             deck_overview: DeckOverviewState::default(),
-            overview_textures: BTreeMap::new(),
-            overview_texture_keys: BTreeMap::new(),
             annotation_edit_enabled: false,
             pending_text_annotation: String::new(),
             text_annotations: Vec::new(),
@@ -1203,10 +673,7 @@ impl PresenterApp {
         Self::cache_budget_bytes_for(&self.config)
     }
 
-    fn clear_overview_textures(&mut self) {
-        self.overview_textures.clear();
-        self.overview_texture_keys.clear();
-    }
+    fn clear_overview_textures(&mut self) {}
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let typing_in_text_field = ctx.wants_keyboard_input();
@@ -1489,6 +956,7 @@ impl PresenterApp {
     fn reset_layout_resolution(&mut self) {
         self.resolved_layout = None;
         self.resolved_layout_key = None;
+        self.resolved_layout_cache.clear();
         self.layout_reason = None;
         self.layout_warning = None;
     }
@@ -1532,7 +1000,9 @@ impl PresenterApp {
         self.non_highlight_unsaved_changes = false;
         self.pending_unsaved_action = None;
         self.allow_close_without_guard = false;
+        self.render_document_generation = self.render_document_generation.wrapping_add(1);
         self.invalidate_render_cache();
+        self.defer_non_critical_texture_refresh(Duration::from_millis(160));
         self.status_message = Some(format!(
             "Loaded {} slide(s) from {}",
             total_slides,
@@ -1561,6 +1031,7 @@ impl PresenterApp {
                 self.stroke_in_progress.clear();
                 self.stroke_in_progress_style = None;
                 self.auto_override_editor_index = None;
+                self.defer_non_critical_texture_refresh(Duration::from_millis(160));
                 self.status_message = Some(format!(
                     "Slide {}/{}",
                     self.state.current_index() + 1,
@@ -1688,9 +1159,14 @@ impl PresenterApp {
             .collapsible(false)
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .frame(
+                self.card_frame()
+                    .fill(self.palette().panel_elevated)
+                    .stroke(Stroke::new(1.0, self.palette().warning)),
+            )
             .show(ctx, |ui| {
-                ui.label("You have unsaved annotation changes.");
-                ui.label("Choose what to do before continuing:");
+                section_title(ui, self.palette(), "Unsaved Changes", Some("annotations"));
+                quiet_label(ui, self.palette(), "Choose what to do before continuing.");
                 ui.add_space(6.0);
 
                 ui.horizontal(|ui| {
@@ -1726,16 +1202,17 @@ impl PresenterApp {
         let Some(message) = self.unsaved_toast_text.as_ref() else {
             return;
         };
+        let palette = self.palette();
         egui::Area::new("unsaved_edit_toast".into())
             .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-16.0, -16.0))
             .show(ctx, |ui| {
                 let frame = egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(12, 14, 20, 220))
-                    .stroke(Stroke::new(1.0, Color32::from_rgb(255, 208, 86)))
-                    .corner_radius(6.0)
-                    .inner_margin(egui::Margin::same(8));
+                    .fill(palette.panel_elevated)
+                    .stroke(Stroke::new(1.0, palette.warning))
+                    .corner_radius(12.0)
+                    .inner_margin(egui::Margin::same(10));
                 frame.show(ui, |ui| {
-                    ui.colored_label(Color32::from_rgb(255, 235, 140), message);
+                    ui.colored_label(palette.warning, message);
                 });
             });
     }
@@ -3212,15 +2689,12 @@ impl PresenterApp {
 
     fn draw_highlight_overlay_from_snapshot(
         ui: &egui::Ui,
-        image_rect: Rect,
-        clip_rect: Rect,
-        region: SlideRegion,
-        surface_space: SlideSurfaceSpace,
+        surface: HighlightOverlaySurface,
         overlay: &HighlightOverlaySnapshot,
         show_selected_strokes: bool,
         show_lasso: bool,
     ) {
-        let painter = ui.painter().with_clip_rect(clip_rect);
+        let painter = ui.painter().with_clip_rect(surface.clip_rect);
 
         for stroke in &overlay.strokes {
             let stroke_style = Stroke::new(
@@ -3228,14 +2702,20 @@ impl PresenterApp {
                 Self::color32_from_rgb_opacity(stroke.color_rgb, stroke.opacity),
             );
             for segment in stroke.points.windows(2) {
-                let Some(start) =
-                    Self::page_normalized_to_screen(image_rect, region, segment[0], surface_space)
-                else {
+                let Some(start) = Self::page_normalized_to_screen(
+                    surface.image_rect,
+                    surface.region,
+                    segment[0],
+                    surface.surface_space,
+                ) else {
                     continue;
                 };
-                let Some(end) =
-                    Self::page_normalized_to_screen(image_rect, region, segment[1], surface_space)
-                else {
+                let Some(end) = Self::page_normalized_to_screen(
+                    surface.image_rect,
+                    surface.region,
+                    segment[1],
+                    surface.surface_space,
+                ) else {
                     continue;
                 };
                 painter.line_segment([start, end], stroke_style);
@@ -3246,18 +2726,18 @@ impl PresenterApp {
                 let selected_style = Stroke::new(4.0, Color32::from_rgb(90, 220, 255));
                 for segment in stroke.points.windows(2) {
                     let Some(start) = Self::page_normalized_to_screen(
-                        image_rect,
-                        region,
+                        surface.image_rect,
+                        surface.region,
                         segment[0],
-                        surface_space,
+                        surface.surface_space,
                     ) else {
                         continue;
                     };
                     let Some(end) = Self::page_normalized_to_screen(
-                        image_rect,
-                        region,
+                        surface.image_rect,
+                        surface.region,
                         segment[1],
-                        surface_space,
+                        surface.surface_space,
                     ) else {
                         continue;
                     };
@@ -3276,14 +2756,20 @@ impl PresenterApp {
             let Some(stroke_style) = in_progress_style else {
                 break;
             };
-            let Some(start) =
-                Self::page_normalized_to_screen(image_rect, region, segment[0], surface_space)
-            else {
+            let Some(start) = Self::page_normalized_to_screen(
+                surface.image_rect,
+                surface.region,
+                segment[0],
+                surface.surface_space,
+            ) else {
                 continue;
             };
-            let Some(end) =
-                Self::page_normalized_to_screen(image_rect, region, segment[1], surface_space)
-            else {
+            let Some(end) = Self::page_normalized_to_screen(
+                surface.image_rect,
+                surface.region,
+                segment[1],
+                surface.surface_space,
+            ) else {
                 continue;
             };
             painter.line_segment([start, end], stroke_style);
@@ -3295,14 +2781,20 @@ impl PresenterApp {
         {
             let lasso_style = Stroke::new(2.0, Color32::from_rgb(120, 220, 255));
             for segment in overlay.lasso_path_in_progress.windows(2) {
-                let Some(start) =
-                    Self::page_normalized_to_screen(image_rect, region, segment[0], surface_space)
-                else {
+                let Some(start) = Self::page_normalized_to_screen(
+                    surface.image_rect,
+                    surface.region,
+                    segment[0],
+                    surface.surface_space,
+                ) else {
                     continue;
                 };
-                let Some(end) =
-                    Self::page_normalized_to_screen(image_rect, region, segment[1], surface_space)
-                else {
+                let Some(end) = Self::page_normalized_to_screen(
+                    surface.image_rect,
+                    surface.region,
+                    segment[1],
+                    surface.surface_space,
+                ) else {
                     continue;
                 };
                 painter.line_segment([start, end], lasso_style);
@@ -3311,8 +2803,18 @@ impl PresenterApp {
                 overlay.lasso_path_in_progress.first().copied(),
                 overlay.lasso_path_in_progress.last().copied(),
             ) && let (Some(first_screen), Some(last_screen)) = (
-                Self::page_normalized_to_screen(image_rect, region, first, surface_space),
-                Self::page_normalized_to_screen(image_rect, region, last, surface_space),
+                Self::page_normalized_to_screen(
+                    surface.image_rect,
+                    surface.region,
+                    first,
+                    surface.surface_space,
+                ),
+                Self::page_normalized_to_screen(
+                    surface.image_rect,
+                    surface.region,
+                    last,
+                    surface.surface_space,
+                ),
             ) {
                 painter.line_segment([last_screen, first_screen], lasso_style);
             }
@@ -3331,10 +2833,12 @@ impl PresenterApp {
         let overlay = self.highlight_overlay_snapshot_for_index(index);
         Self::draw_highlight_overlay_from_snapshot(
             ui,
-            image_rect,
-            clip_rect,
-            region,
-            SlideSurfaceSpace::CroppedSlide,
+            HighlightOverlaySurface {
+                image_rect,
+                clip_rect,
+                region,
+                surface_space: SlideSurfaceSpace::CroppedSlide,
+            },
             &overlay,
             true,
             true,
@@ -3389,7 +2893,13 @@ impl PresenterApp {
     }
 
     fn draw_badge(ui: &egui::Ui, rect: Rect, text: &str, fill: Color32, text_color: Color32) {
-        ui.painter().rect_filled(rect, 6.0, fill);
+        ui.painter().rect_filled(rect, 8.0, fill);
+        ui.painter().rect_stroke(
+            rect,
+            8.0,
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 28)),
+            egui::StrokeKind::Outside,
+        );
         ui.painter().text(
             rect.center(),
             Align2::CENTER_CENTER,
@@ -3413,6 +2923,27 @@ impl PresenterApp {
             "UNSAVED",
             Color32::from_rgba_unmultiplied(120, 26, 26, 220),
             Color32::from_rgb(255, 220, 220),
+        );
+    }
+
+    fn draw_rendering_overlay(ui: &egui::Ui, rect: Rect, palette: ThemePalette, label: &str) {
+        ui.painter()
+            .rect_filled(rect, 6.0, Color32::from_rgba_unmultiplied(0, 0, 0, 118));
+        let badge_rect = Rect::from_center_size(rect.center(), Vec2::new(128.0, 30.0));
+        ui.painter()
+            .rect_filled(badge_rect, 10.0, palette.accent_soft);
+        ui.painter().rect_stroke(
+            badge_rect,
+            10.0,
+            Stroke::new(1.0, palette.accent),
+            egui::StrokeKind::Outside,
+        );
+        ui.painter().text(
+            badge_rect.center(),
+            Align2::CENTER_CENTER,
+            label,
+            FontId::new(12.0, FontFamily::Proportional),
+            palette.active_pill_text,
         );
     }
 
@@ -3623,13 +3154,13 @@ impl PresenterApp {
                 ui.set_width(overlay_width);
                 ui.set_max_width(overlay_width);
                 let frame = egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(18, 22, 30, 218))
+                    .fill(Color32::from_rgba_unmultiplied(19, 25, 34, 232))
                     .stroke(Stroke::new(
                         1.0,
-                        Color32::from_rgba_unmultiplied(90, 100, 120, 220),
+                        Color32::from_rgba_unmultiplied(85, 105, 126, 225),
                     ))
-                    .corner_radius(6.0)
-                    .inner_margin(egui::Margin::same(6));
+                    .corner_radius(14.0)
+                    .inner_margin(egui::Margin::same(10));
                 frame.show(ui, |ui| {
                     self.render_pen_toolkit_controls(ui, true, index);
                     ui.separator();
@@ -3765,6 +3296,7 @@ impl PresenterApp {
                 self.eraser_erased_in_drag.clear();
                 self.eraser_removed_this_drag = false;
                 self.non_highlight_unsaved_changes = false;
+                self.render_document_generation = self.render_document_generation.wrapping_add(1);
                 self.invalidate_render_cache();
                 self.status_message = Some("PDF reloaded after file change.".to_owned());
             }
@@ -3785,14 +3317,42 @@ impl PresenterApp {
         self.texture_cache = PageCache::new(self.config.cache_size, self.cache_budget_bytes());
         self.projector_texture_key = None;
         self.current_texture_key = None;
+        self.projector_low_res_texture_key = None;
+        self.current_low_res_texture_key = None;
         self.presenter_texture_key = None;
         self.notes_texture_key = None;
         self.next_texture_key = None;
+        self.presenter_texture_pending = false;
+        self.notes_texture_pending = false;
+        self.next_texture_pending = false;
+        self.presenter_texture_low_res = false;
+        self.notes_texture_low_res = false;
+        self.next_texture_low_res = false;
+        self.presenter_low_res_texture_key = None;
+        self.notes_low_res_texture_key = None;
+        self.next_low_res_texture_key = None;
         self.clear_overview_textures();
         self.reset_layout_resolution();
         self.text_annotation_cache_index = None;
         self.original_text_annotations.clear();
         self.active_text_transform = None;
+    }
+
+    fn defer_non_critical_texture_refresh(&mut self, duration: Duration) {
+        self.non_critical_texture_refresh_after = Some(Instant::now() + duration);
+    }
+
+    fn non_critical_texture_refresh_ready(&mut self) -> bool {
+        let Some(after) = self.non_critical_texture_refresh_after else {
+            return true;
+        };
+
+        if Instant::now() < after {
+            return false;
+        }
+
+        self.non_critical_texture_refresh_after = None;
+        true
     }
 
     fn mode_id(mode: NotesMode) -> usize {
@@ -3884,6 +3444,10 @@ impl PresenterApp {
         key
     }
 
+    fn low_res_render_width(target_width: usize) -> usize {
+        (target_width / 2).clamp(360, 1200).min(target_width)
+    }
+
     fn get_or_render_texture(
         &mut self,
         ctx: &Context,
@@ -3892,7 +3456,7 @@ impl PresenterApp {
         layout: Option<NotesLayout>,
         target_width: usize,
         namespace: usize,
-    ) -> Result<(usize, TextureHandle)> {
+    ) -> Result<ProgressiveTexture> {
         let key = Self::texture_cache_key(
             index,
             self.config.notes_mode,
@@ -3902,7 +3466,54 @@ impl PresenterApp {
             namespace,
         );
         if let Some(entry) = self.texture_cache.get(key) {
-            return Ok((key, entry.texture.clone()));
+            return Ok(ProgressiveTexture {
+                target_key: key,
+                texture_key: Some(key),
+                texture: Some(entry.texture.clone()),
+                is_low_res: false,
+            });
+        }
+
+        let low_res_width = Self::low_res_render_width(target_width);
+        if low_res_width < target_width {
+            let low_res_key = Self::texture_cache_key(
+                index,
+                self.config.notes_mode,
+                view,
+                layout,
+                low_res_width,
+                namespace,
+            );
+            self.request_background_render(BackgroundRenderRequest {
+                cache_key: key,
+                index,
+                view,
+                layout,
+                target_width,
+                namespace,
+                priority: RenderPriority::High,
+            });
+            if let Some(entry) = self.texture_cache.get(low_res_key) {
+                return Ok(ProgressiveTexture {
+                    target_key: key,
+                    texture_key: Some(low_res_key),
+                    texture: Some(entry.texture.clone()),
+                    is_low_res: true,
+                });
+            }
+
+            let document = self
+                .document
+                .as_ref()
+                .ok_or_else(|| anyhow!("no document loaded"))?;
+            let bitmap = document.render_page_bitmap(index, view, layout, low_res_width)?;
+            let texture = self.upload_bitmap_texture(ctx, low_res_key, namespace, bitmap);
+            return Ok(ProgressiveTexture {
+                target_key: key,
+                texture_key: Some(low_res_key),
+                texture: Some(texture),
+                is_low_res: true,
+            });
         }
 
         let document = self
@@ -3910,6 +3521,121 @@ impl PresenterApp {
             .as_ref()
             .ok_or_else(|| anyhow!("no document loaded"))?;
         let bitmap = document.render_page_bitmap(index, view, layout, target_width)?;
+        let texture = self.upload_bitmap_texture(ctx, key, namespace, bitmap);
+        Ok(ProgressiveTexture {
+            target_key: key,
+            texture_key: Some(key),
+            texture: Some(texture),
+            is_low_res: false,
+        })
+    }
+
+    fn cached_or_request_texture(
+        &mut self,
+        index: usize,
+        view: PageView,
+        layout: Option<NotesLayout>,
+        target_width: usize,
+        namespace: usize,
+        priority: RenderPriority,
+    ) -> ProgressiveTexture {
+        let key = Self::texture_cache_key(
+            index,
+            self.config.notes_mode,
+            view,
+            layout,
+            target_width,
+            namespace,
+        );
+        if let Some(entry) = self.texture_cache.get(key) {
+            return ProgressiveTexture {
+                target_key: key,
+                texture_key: Some(key),
+                texture: Some(entry.texture.clone()),
+                is_low_res: false,
+            };
+        }
+
+        self.request_background_render(BackgroundRenderRequest {
+            cache_key: key,
+            index,
+            view,
+            layout,
+            target_width,
+            namespace,
+            priority,
+        });
+
+        let low_res_width = Self::low_res_render_width(target_width);
+        if low_res_width < target_width {
+            let low_res_key = Self::texture_cache_key(
+                index,
+                self.config.notes_mode,
+                view,
+                layout,
+                low_res_width,
+                namespace,
+            );
+            if let Some(entry) = self.texture_cache.get(low_res_key) {
+                return ProgressiveTexture {
+                    target_key: key,
+                    texture_key: Some(low_res_key),
+                    texture: Some(entry.texture.clone()),
+                    is_low_res: true,
+                };
+            }
+
+            self.request_background_render(BackgroundRenderRequest {
+                cache_key: low_res_key,
+                index,
+                view,
+                layout,
+                target_width: low_res_width,
+                namespace,
+                priority,
+            });
+        }
+
+        ProgressiveTexture {
+            target_key: key,
+            texture_key: None,
+            texture: None,
+            is_low_res: false,
+        }
+    }
+
+    fn request_background_render(&mut self, request: BackgroundRenderRequest) {
+        if self.texture_cache.contains(request.cache_key) {
+            return;
+        }
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+
+        let job = RenderJob {
+            key: RenderJobKey {
+                cache_key: request.cache_key,
+                document_generation: self.render_document_generation,
+            },
+            source_path: document.source_path().to_path_buf(),
+            index: request.index,
+            mode: self.config.notes_mode,
+            view: request.view,
+            layout: request.layout,
+            target_width: request.target_width,
+            namespace: request.namespace,
+            priority: request.priority,
+        };
+        self.render_worker.request(job);
+    }
+
+    fn upload_bitmap_texture(
+        &mut self,
+        ctx: &Context,
+        key: usize,
+        namespace: usize,
+        bitmap: crate::document::PageBitmap,
+    ) -> TextureHandle {
         let byte_estimate = bitmap.rgba.len();
         let image =
             egui::ColorImage::from_rgba_unmultiplied([bitmap.width, bitmap.height], &bitmap.rgba);
@@ -3926,62 +3652,113 @@ impl PresenterApp {
                 byte_estimate,
             },
         );
-        Ok((key, texture))
+        texture
+    }
+
+    fn apply_background_render_results(&mut self, ctx: &Context) {
+        let mut applied_result = false;
+        for result in self.render_worker.drain_results() {
+            match result {
+                RenderResult::Ready {
+                    key,
+                    namespace,
+                    bitmap,
+                } => {
+                    if key.document_generation != self.render_document_generation {
+                        continue;
+                    }
+                    if !self.texture_cache.contains(key.cache_key) {
+                        drop(self.upload_bitmap_texture(ctx, key.cache_key, namespace, bitmap));
+                    }
+                    applied_result = true;
+                }
+                RenderResult::Failed { key, message } => {
+                    if key.document_generation == self.render_document_generation {
+                        self.open_error = Some(message);
+                        applied_result = true;
+                    }
+                }
+            }
+        }
+        if applied_result {
+            ctx.request_repaint();
+        }
+    }
+
+    fn apply_cached_resolved_layout(
+        &mut self,
+        resolution_key: usize,
+        cached: CachedResolvedLayout,
+    ) -> Option<NotesLayout> {
+        self.resolved_layout_key = Some(resolution_key);
+        self.resolved_layout = cached.layout;
+        self.layout_reason = cached.reason;
+        self.layout_warning = cached.warning;
+        self.resolved_layout
     }
 
     fn resolve_layout_for_slide(&mut self, index: usize) -> Option<NotesLayout> {
         let resolution_key = self.layout_resolution_key(index);
-        if self.resolved_layout_key == Some(resolution_key) {
-            return self.resolved_layout;
+        if let Some(cached) = self.resolved_layout_cache.get(&resolution_key).cloned() {
+            return self.apply_cached_resolved_layout(resolution_key, cached);
         }
 
-        self.resolved_layout_key = Some(resolution_key);
-        self.layout_warning = None;
+        let cached = if let Some(layout) = self.active_override_layout() {
+            CachedResolvedLayout {
+                layout: Some(layout),
+                reason: Some("Manual layout override is active.".to_owned()),
+                warning: None,
+            }
+        } else {
+            let Some(document) = self.document.as_ref() else {
+                let cached = CachedResolvedLayout {
+                    layout: None,
+                    reason: Some("No document loaded.".to_owned()),
+                    warning: None,
+                };
+                self.resolved_layout_cache
+                    .insert(resolution_key, cached.clone());
+                return self.apply_cached_resolved_layout(resolution_key, cached);
+            };
 
-        if let Some(layout) = self.active_override_layout() {
-            self.resolved_layout = Some(layout);
-            self.layout_reason = Some("Manual layout override is active.".to_owned());
-            return self.resolved_layout;
-        }
-
-        let Some(document) = self.document.as_ref() else {
-            self.resolved_layout = None;
-            self.layout_reason = Some("No document loaded.".to_owned());
-            return None;
+            match document.detect_notes_layout(index, self.config.notes_mode) {
+                Ok(result) => {
+                    let mut warning = result.warning.clone();
+                    let resolved = if self.config.notes_mode == NotesMode::Auto {
+                        match result.layout {
+                            Some(layout)
+                                if result.confidence >= self.config.notes_confidence_threshold =>
+                            {
+                                Some(layout)
+                            }
+                            _ => {
+                                warning = Some(format!(
+                                    "Auto split confidence {:.2} below threshold {:.2}; using full page.",
+                                    result.confidence, self.config.notes_confidence_threshold
+                                ));
+                                None
+                            }
+                        }
+                    } else {
+                        result.layout
+                    };
+                    CachedResolvedLayout {
+                        layout: resolved,
+                        reason: Some(result.reason),
+                        warning,
+                    }
+                }
+                Err(error) => CachedResolvedLayout {
+                    layout: None,
+                    reason: Some("Falling back to full-page rendering.".to_owned()),
+                    warning: Some(format!("Layout detection failed: {error}")),
+                },
+            }
         };
 
-        match document.detect_notes_layout(index, self.config.notes_mode) {
-            Ok(result) => {
-                self.layout_warning = result.warning.clone();
-                self.layout_reason = Some(result.reason.clone());
-                let resolved = if self.config.notes_mode == NotesMode::Auto {
-                    match result.layout {
-                        Some(layout)
-                            if result.confidence >= self.config.notes_confidence_threshold =>
-                        {
-                            Some(layout)
-                        }
-                        _ => {
-                            self.layout_warning = Some(format!(
-                                "Auto split confidence {:.2} below threshold {:.2}; using full page.",
-                                result.confidence, self.config.notes_confidence_threshold
-                            ));
-                            None
-                        }
-                    }
-                } else {
-                    result.layout
-                };
-                self.resolved_layout = resolved;
-                resolved
-            }
-            Err(error) => {
-                self.layout_warning = Some(format!("Layout detection failed: {error}"));
-                self.layout_reason = Some("Falling back to full-page rendering.".to_owned());
-                self.resolved_layout = None;
-                None
-            }
-        }
+        self.resolved_layout_cache
+            .insert(resolution_key, cached.clone());
+        self.apply_cached_resolved_layout(resolution_key, cached)
     }
 
     fn refresh_textures(&mut self, ctx: &Context) {
@@ -4004,6 +3781,7 @@ impl PresenterApp {
         let projector_layout = self.resolve_layout_for_slide(projector_index);
         let presenter_layout = self.resolve_layout_for_slide(presenter_index);
         let next_layout = self.resolve_layout_for_slide(next_index);
+        let non_critical_refresh_ready = self.non_critical_texture_refresh_ready();
 
         if Self::has_visible_region(projector_layout, PageView::SlideOnly) {
             match self.get_or_render_texture(
@@ -4014,9 +3792,11 @@ impl PresenterApp {
                 projector_width,
                 1,
             ) {
-                Ok((key, texture)) => {
-                    self.projector_texture = Some(texture);
-                    self.projector_texture_key = Some(key);
+                Ok(progressive_texture) => {
+                    self.update_critical_texture(
+                        progressive_texture,
+                        CriticalTextureSlot::Projector,
+                    );
                 }
                 Err(error) => {
                     self.open_error = Some(format!("Projector render failed: {error}"));
@@ -4036,9 +3816,8 @@ impl PresenterApp {
                 presenter_width,
                 1,
             ) {
-                Ok((key, texture)) => {
-                    self.current_texture = Some(texture);
-                    self.current_texture_key = Some(key);
+                Ok(progressive_texture) => {
+                    self.update_critical_texture(progressive_texture, CriticalTextureSlot::Current);
                 }
                 Err(error) => {
                     self.open_error = Some(format!("Current slide render failed: {error}"));
@@ -4049,67 +3828,234 @@ impl PresenterApp {
             self.current_texture_key = None;
         }
 
-        match self.get_or_render_texture(
-            ctx,
+        let presenter_texture = self.cached_or_request_texture(
             presenter_index,
             PageView::Full,
             presenter_layout,
             presenter_width,
             1,
-        ) {
-            Ok((key, texture)) => {
-                self.presenter_texture = Some(texture);
-                self.presenter_texture_key = Some(key);
-            }
-            Err(error) => {
-                self.open_error = Some(format!("Presenter render failed: {error}"));
-            }
-        }
+            RenderPriority::High,
+        );
+        self.update_secondary_texture(
+            presenter_texture,
+            non_critical_refresh_ready,
+            SecondaryTextureSlot::Presenter,
+        );
 
         if next_index != presenter_index
             && Self::has_visible_region(next_layout, PageView::SlideOnly)
         {
-            match self.get_or_render_texture(
-                ctx,
+            let next_texture = self.cached_or_request_texture(
                 next_index,
                 PageView::SlideOnly,
                 next_layout,
                 next_width,
                 1,
-            ) {
-                Ok((key, texture)) => {
-                    self.next_texture = Some(texture);
-                    self.next_texture_key = Some(key);
-                }
-                Err(error) => {
-                    self.open_error = Some(format!("Next slide render failed: {error}"));
-                }
-            }
+                RenderPriority::Normal,
+            );
+            self.update_secondary_texture(
+                next_texture,
+                non_critical_refresh_ready,
+                SecondaryTextureSlot::Next,
+            );
         } else {
             self.next_texture = None;
             self.next_texture_key = None;
+            self.next_texture_pending = false;
+            self.next_texture_low_res = false;
         }
 
         if Self::has_visible_region(presenter_layout, PageView::NotesOnly) {
-            match self.get_or_render_texture(
-                ctx,
+            let notes_texture = self.cached_or_request_texture(
                 presenter_index,
                 PageView::NotesOnly,
                 presenter_layout,
                 notes_width,
                 1,
-            ) {
-                Ok((key, texture)) => {
-                    self.notes_texture = Some(texture);
-                    self.notes_texture_key = Some(key);
-                }
-                Err(error) => {
-                    self.open_error = Some(format!("Notes render failed: {error}"));
-                }
-            }
+                RenderPriority::Normal,
+            );
+            self.update_secondary_texture(
+                notes_texture,
+                non_critical_refresh_ready,
+                SecondaryTextureSlot::Notes,
+            );
         } else {
             self.notes_texture = None;
             self.notes_texture_key = None;
+            self.notes_texture_pending = false;
+            self.notes_texture_low_res = false;
+        }
+
+        self.prefetch_adjacent_slide_textures(projector_index);
+    }
+
+    fn update_critical_texture(
+        &mut self,
+        progressive_texture: ProgressiveTexture,
+        slot: CriticalTextureSlot,
+    ) {
+        let Some(texture) = progressive_texture.texture else {
+            return;
+        };
+
+        let previous_low_res_key = match slot {
+            CriticalTextureSlot::Projector => self.projector_low_res_texture_key,
+            CriticalTextureSlot::Current => self.current_low_res_texture_key,
+        };
+        let mut low_res_key_to_remove = None;
+        let next_low_res_key = if progressive_texture.is_low_res {
+            progressive_texture.texture_key
+        } else {
+            if let Some(previous_low_res_key) = previous_low_res_key
+                && previous_low_res_key != progressive_texture.target_key
+            {
+                low_res_key_to_remove = Some(previous_low_res_key);
+            }
+            None
+        };
+
+        match slot {
+            CriticalTextureSlot::Projector => {
+                self.projector_texture = Some(texture);
+                self.projector_texture_key = Some(progressive_texture.target_key);
+                self.projector_low_res_texture_key = next_low_res_key;
+            }
+            CriticalTextureSlot::Current => {
+                self.current_texture = Some(texture);
+                self.current_texture_key = Some(progressive_texture.target_key);
+                self.current_low_res_texture_key = next_low_res_key;
+            }
+        }
+
+        if let Some(key) = low_res_key_to_remove {
+            drop(self.texture_cache.remove(key));
+        }
+    }
+
+    fn update_secondary_texture(
+        &mut self,
+        progressive_texture: ProgressiveTexture,
+        can_clear_stale_texture: bool,
+        slot: SecondaryTextureSlot,
+    ) {
+        let (target_texture, target_key, target_pending, target_low_res) = match slot {
+            SecondaryTextureSlot::Presenter => (
+                &mut self.presenter_texture,
+                &mut self.presenter_texture_key,
+                &mut self.presenter_texture_pending,
+                &mut self.presenter_texture_low_res,
+            ),
+            SecondaryTextureSlot::Notes => (
+                &mut self.notes_texture,
+                &mut self.notes_texture_key,
+                &mut self.notes_texture_pending,
+                &mut self.notes_texture_low_res,
+            ),
+            SecondaryTextureSlot::Next => (
+                &mut self.next_texture,
+                &mut self.next_texture_key,
+                &mut self.next_texture_pending,
+                &mut self.next_texture_low_res,
+            ),
+        };
+
+        let previous_low_res_key = match slot {
+            SecondaryTextureSlot::Presenter => self.presenter_low_res_texture_key,
+            SecondaryTextureSlot::Notes => self.notes_low_res_texture_key,
+            SecondaryTextureSlot::Next => self.next_low_res_texture_key,
+        };
+        let mut low_res_key_to_remove = None;
+        let mut next_low_res_key = previous_low_res_key;
+
+        match progressive_texture.texture {
+            Some(texture) => {
+                *target_texture = Some(texture);
+                *target_key = Some(progressive_texture.target_key);
+                *target_pending = progressive_texture.is_low_res;
+                *target_low_res = progressive_texture.is_low_res;
+                if progressive_texture.is_low_res {
+                    next_low_res_key = progressive_texture.texture_key;
+                } else if let Some(previous_low_res_key) = previous_low_res_key {
+                    if previous_low_res_key != progressive_texture.target_key {
+                        low_res_key_to_remove = Some(previous_low_res_key);
+                    }
+                    next_low_res_key = None;
+                }
+            }
+            None if *target_key != Some(progressive_texture.target_key) => {
+                if can_clear_stale_texture && target_texture.is_none() {
+                    *target_key = Some(progressive_texture.target_key);
+                }
+                *target_pending = true;
+                *target_low_res = false;
+            }
+            None => {
+                *target_pending = true;
+                *target_low_res = false;
+            }
+        }
+
+        match slot {
+            SecondaryTextureSlot::Presenter => {
+                self.presenter_low_res_texture_key = next_low_res_key
+            }
+            SecondaryTextureSlot::Notes => self.notes_low_res_texture_key = next_low_res_key,
+            SecondaryTextureSlot::Next => self.next_low_res_texture_key = next_low_res_key,
+        }
+        if let Some(key) = low_res_key_to_remove {
+            drop(self.texture_cache.remove(key));
+        }
+    }
+
+    fn prefetch_adjacent_slide_textures(&mut self, current_index: usize) {
+        let next_index = current_index.saturating_add(1);
+        if next_index >= self.state.total_slides() {
+            return;
+        }
+
+        let next_layout = self.resolve_layout_for_slide(next_index);
+        if !Self::has_visible_region(next_layout, PageView::SlideOnly) {
+            return;
+        }
+
+        let projector_key = Self::texture_cache_key(
+            next_index,
+            self.config.notes_mode,
+            PageView::SlideOnly,
+            next_layout,
+            self.config.projector_render_width,
+            1,
+        );
+        if !self.texture_cache.contains(projector_key) {
+            self.request_background_render(BackgroundRenderRequest {
+                cache_key: projector_key,
+                index: next_index,
+                view: PageView::SlideOnly,
+                layout: next_layout,
+                target_width: self.config.projector_render_width,
+                namespace: 1,
+                priority: RenderPriority::High,
+            });
+        }
+
+        let presenter_key = Self::texture_cache_key(
+            next_index,
+            self.config.notes_mode,
+            PageView::SlideOnly,
+            next_layout,
+            self.config.presenter_render_width,
+            1,
+        );
+        if !self.texture_cache.contains(presenter_key) {
+            self.request_background_render(BackgroundRenderRequest {
+                cache_key: presenter_key,
+                index: next_index,
+                view: PageView::SlideOnly,
+                layout: next_layout,
+                target_width: self.config.presenter_render_width,
+                namespace: 1,
+                priority: RenderPriority::Normal,
+            });
         }
     }
 
@@ -4249,12 +4195,14 @@ impl PresenterApp {
         }
 
         let model = self.timing_breakdown_model(Instant::now());
+        let palette = self.palette();
         let mut open = self.timing_breakdown.is_open;
         egui::Window::new("Timing Breakdown (B)")
             .open(&mut open)
             .resizable(true)
             .default_width(560.0)
             .default_height(680.0)
+            .frame(self.card_frame())
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(format!("Total: {}", Self::format_duration(model.total)));
@@ -4279,10 +4227,7 @@ impl PresenterApp {
                             } => {
                                 ui.horizontal(|ui| {
                                     ui.add_space((*depth as f32) * 14.0);
-                                    ui.colored_label(
-                                        Color32::from_rgb(140, 195, 255),
-                                        format!("Section: {title}"),
-                                    );
+                                    ui.colored_label(palette.accent, format!("Section: {title}"));
                                     ui.with_layout(
                                         egui::Layout::right_to_left(Align::Center),
                                         |ui| {
@@ -4331,6 +4276,7 @@ impl PresenterApp {
             .open(&mut open)
             .resizable(true)
             .default_width(420.0)
+            .frame(self.card_frame())
             .show(ctx, |ui| {
                 self.render_performance_controls(ui);
             });
@@ -4358,51 +4304,19 @@ impl PresenterApp {
 
     fn get_or_render_overview_texture(
         &mut self,
-        ctx: &Context,
         index: usize,
         layout: Option<NotesLayout>,
     ) -> Option<TextureHandle> {
         let target_width = self.config.overview_thumbnail_width;
-        let cache_key = Self::texture_cache_key(
+        let progressive_texture = self.cached_or_request_texture(
             index,
-            self.config.notes_mode,
             PageView::SlideOnly,
             layout,
             target_width,
             2,
+            RenderPriority::Low,
         );
-
-        if self.overview_texture_keys.get(&index).copied() == Some(cache_key) {
-            return self.overview_textures.get(&index).cloned();
-        }
-
-        let Some(document) = self.document.as_ref() else {
-            return None;
-        };
-        match document.render_page_bitmap(index, PageView::SlideOnly, layout, target_width) {
-            Ok(bitmap) => {
-                let image = egui::ColorImage::from_rgba_unmultiplied(
-                    [bitmap.width, bitmap.height],
-                    &bitmap.rgba,
-                );
-                if let Some(texture) = self.overview_textures.get_mut(&index) {
-                    texture.set(image, TextureOptions::LINEAR);
-                } else {
-                    let texture = ctx.load_texture(
-                        format!("overview_thumb_{index}"),
-                        image,
-                        TextureOptions::LINEAR,
-                    );
-                    self.overview_textures.insert(index, texture);
-                }
-                self.overview_texture_keys.insert(index, cache_key);
-                self.overview_textures.get(&index).cloned()
-            }
-            Err(error) => {
-                self.open_error = Some(format!("Overview thumbnail render failed: {error}"));
-                None
-            }
-        }
+        progressive_texture.texture
     }
 
     fn render_deck_overview(&mut self, ctx: &Context) {
@@ -4414,12 +4328,14 @@ impl PresenterApp {
         let total = self.state.total_slides();
         let columns = self.config.overview_columns as usize;
         let thumb_layout = self.resolve_layout_for_slide(self.presenter_display_index());
+        let palette = self.palette();
 
         egui::Window::new("Deck Overview (D)")
             .open(&mut open)
             .resizable(true)
             .default_width(1050.0)
             .default_height(720.0)
+            .frame(self.card_frame())
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(format!(
@@ -4453,21 +4369,26 @@ impl PresenterApp {
                                     break;
                                 }
                                 let selected = index == self.deck_overview.selected_index;
-                                let frame = egui::Frame::group(ui.style()).stroke(egui::Stroke {
-                                    width: if selected { 2.0 } else { 1.0 },
-                                    color: if selected {
-                                        Color32::LIGHT_GREEN
+                                let frame = self
+                                    .inset_frame()
+                                    .fill(if selected {
+                                        palette.accent_soft
                                     } else {
-                                        Color32::DARK_GRAY
-                                    },
-                                });
+                                        palette.inset
+                                    })
+                                    .stroke(egui::Stroke {
+                                        width: if selected { 2.0 } else { 1.0 },
+                                        color: if selected {
+                                            palette.accent
+                                        } else {
+                                            palette.inset_stroke
+                                        },
+                                    });
                                 frame.show(ui, |ui| {
                                     ui.vertical(|ui| {
-                                        if let Some(texture) = self.get_or_render_overview_texture(
-                                            ctx,
-                                            index,
-                                            thumb_layout,
-                                        ) {
+                                        if let Some(texture) =
+                                            self.get_or_render_overview_texture(index, thumb_layout)
+                                        {
                                             let base_width = self.config.overview_thumbnail_width
                                                 as f32
                                                 * self.deck_overview.thumbnail_scale;
@@ -4581,12 +4502,13 @@ impl PresenterApp {
         texture: &TextureHandle,
         viewport_size: Vec2,
         zoom_pan_state: &mut ZoomPanState,
+        palette: ThemePalette,
     ) -> (egui::Response, Rect, bool) {
         let safe_viewport = Vec2::new(viewport_size.x.max(1.0), viewport_size.y.max(1.0));
         let (surface_rect, response) =
             ui.allocate_exact_size(safe_viewport, Sense::click_and_drag());
         let painter = ui.painter().with_clip_rect(surface_rect);
-        painter.rect_filled(surface_rect, 0.0, Color32::from_rgb(8, 10, 14));
+        painter.rect_filled(surface_rect, 12.0, palette.slide_surface);
 
         let texture_size = texture.size_vec2();
         let mut image_rect = Self::zoomed_image_rect(texture_size, surface_rect, zoom_pan_state);
@@ -4673,6 +4595,12 @@ impl PresenterApp {
             Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
             Color32::WHITE,
         );
+        painter.rect_stroke(
+            image_rect.expand(1.0),
+            6.0,
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 32)),
+            egui::StrokeKind::Outside,
+        );
 
         (response, image_rect, reset_requested)
     }
@@ -4694,6 +4622,8 @@ impl PresenterApp {
         } else {
             self.projector_texture.clone()
         };
+        let texture_pending = self.state.screen_roles_swapped && self.presenter_texture_pending;
+        let texture_low_res = self.state.screen_roles_swapped && self.presenter_texture_low_res;
         let displayed_index = if self.state.screen_roles_swapped {
             self.presenter_display_index()
         } else {
@@ -4722,10 +4652,11 @@ impl PresenterApp {
         let mut projector_zoom_pan = self.projector_zoom_pan;
         let mut projector_reset_requested = false;
         let laser_position = self.laser_position;
+        let palette = self.palette();
 
         ctx.show_viewport_immediate(self.projector_viewport, viewport, |ctx, _class| {
             egui::CentralPanel::default()
-                .frame(egui::Frame::new().fill(Color32::from_rgb(12, 14, 20)))
+                .frame(egui::Frame::new().fill(palette.slide_surface))
                 .show(ctx, |ui| {
                     if let Some(texture) = texture.as_ref() {
                         let viewport_size = ui.available_size();
@@ -4736,6 +4667,7 @@ impl PresenterApp {
                                 texture,
                                 viewport_size,
                                 &mut projector_zoom_pan,
+                                palette,
                             );
                         if reset_requested {
                             projector_reset_requested = true;
@@ -4745,10 +4677,12 @@ impl PresenterApp {
                         ));
                         PresenterApp::draw_highlight_overlay_from_snapshot(
                             ui,
-                            image_rect,
-                            response.rect,
-                            slide_region,
-                            surface_space,
+                            HighlightOverlaySurface {
+                                image_rect,
+                                clip_rect: response.rect,
+                                region: slide_region,
+                                surface_space,
+                            },
                             &highlight_overlay,
                             false,
                             false,
@@ -4761,13 +4695,21 @@ impl PresenterApp {
                             slide_region,
                             surface_space,
                         );
+                        if texture_pending {
+                            let label = if texture_low_res {
+                                "Sharpening slide"
+                            } else {
+                                "Rendering slide"
+                            };
+                            PresenterApp::draw_rendering_overlay(ui, image_rect, palette, label);
+                        }
                     } else {
                         ui.vertical_centered(|ui| {
                             ui.add_space(40.0);
                             ui.label(
                                 RichText::new("No slide rendered yet")
                                     .font(FontId::new(28.0, FontFamily::Proportional))
-                                    .color(Color32::LIGHT_GRAY),
+                                    .color(palette.text_secondary),
                             );
                         });
                     }
@@ -4782,7 +4724,7 @@ impl PresenterApp {
                             badge_rect,
                             badge_text,
                             Color32::from_rgba_unmultiplied(0, 0, 0, 175),
-                            Color32::from_rgb(170, 255, 170),
+                            palette.active_pill_text,
                         );
                     }
                     if show_dirty_badge {
@@ -4794,8 +4736,8 @@ impl PresenterApp {
                             ui,
                             dirty_rect,
                             "UNSAVED",
-                            Color32::from_rgba_unmultiplied(120, 26, 26, 220),
-                            Color32::from_rgb(255, 220, 220),
+                            palette.unsaved_pill,
+                            palette.unsaved_pill_text,
                         );
                     }
                     if projector_zoom_pan.zoom > 1.001 {
@@ -4808,7 +4750,7 @@ impl PresenterApp {
                             zoom_rect,
                             &format!("ZOOM {:.0}%", projector_zoom_pan.zoom * 100.0),
                             Color32::from_rgba_unmultiplied(20, 20, 20, 210),
-                            Color32::from_rgb(210, 230, 255),
+                            palette.talk_pill_text,
                         );
                     }
                 });
@@ -4844,61 +4786,127 @@ impl PresenterApp {
         if interaction_mode == InteractionMode::AnnotationEdit {
             self.refresh_text_annotations_for_index(display_index);
         }
+        let palette = self.palette();
 
-        egui::TopBottomPanel::top("top_controls").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("PDF Path:");
-                let path_response = ui.text_edit_singleline(&mut self.source_path_input);
-                let load_clicked = ui.button("Load").clicked();
-                let enter_pressed =
-                    path_response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
-                if load_clicked || enter_pressed {
-                    let source = PathBuf::from(self.source_path_input.trim());
-                    if source.exists() {
-                        self.request_load_document(source);
-                    } else {
-                        self.open_error = Some("Path does not exist.".to_owned());
+        egui::TopBottomPanel::top("top_controls")
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.top_bar)
+                    .stroke(Stroke::new(1.0, palette.panel_stroke))
+                    .inner_margin(egui::Margin::symmetric(14, 10)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new("Decklight")
+                            .font(FontId::new(20.0, FontFamily::Proportional))
+                            .strong()
+                            .color(palette.text_primary),
+                    );
+                    quiet_label(ui, palette, "Dual-screen PDF presenter");
+                    ui.separator();
+                    status_pill(ui, palette, "Laser", self.state.laser_enabled);
+                    status_pill(ui, palette, "Highlight", self.state.highlight_enabled);
+                    status_pill(ui, palette, "Edit", self.annotation_edit_enabled);
+                    if self.has_unsaved_annotation_changes() {
+                        ui.label(pill_text(
+                            "Unsaved",
+                            palette.unsaved_pill,
+                            palette.unsaved_pill_text,
+                        ));
                     }
-                }
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("PDF").color(palette.text_secondary));
+                    let path_width = (ui.available_width() * 0.34).clamp(240.0, 520.0);
+                    let path_response = ui.add_sized(
+                        Vec2::new(path_width, 30.0),
+                        egui::TextEdit::singleline(&mut self.source_path_input)
+                            .hint_text("Drop in a PDF path"),
+                    );
+                    let load_clicked = ui
+                        .add(
+                            egui::Button::new(RichText::new("Load").strong())
+                                .fill(palette.accent_soft)
+                                .stroke(Stroke::new(1.0, palette.accent)),
+                        )
+                        .clicked();
+                    let enter_pressed = path_response.lost_focus()
+                        && ui.input(|input| input.key_pressed(Key::Enter));
+                    if load_clicked || enter_pressed {
+                        let source = PathBuf::from(self.source_path_input.trim());
+                        if source.exists() {
+                            self.request_load_document(source);
+                        } else {
+                            self.open_error = Some("Path does not exist.".to_owned());
+                        }
+                    }
+
+                    ui.separator();
+                    if ui.button("Prev").clicked() {
+                        self.apply_command(AppCommand::PreviousSlide);
+                    }
+                    if ui.button("Next").clicked() {
+                        self.apply_command(AppCommand::NextSlide);
+                    }
+                    if ui.button("First").clicked() {
+                        self.apply_command(AppCommand::FirstSlide);
+                    }
+                    if ui.button("Last").clicked() {
+                        self.apply_command(AppCommand::LastSlide);
+                    }
+                    if ui.button("Swap (S)").clicked() {
+                        self.apply_command(AppCommand::SwapScreens);
+                    }
+                    if ui.button("Fullscreen (F)").clicked() {
+                        self.apply_command(AppCommand::ToggleProjectorFullscreen);
+                        self.persist_config();
+                    }
+                    if ui.button("Save").clicked() {
+                        self.save_document_in_place();
+                    }
+                    if ui.button("Timing").clicked() {
+                        self.timing_breakdown.toggle();
+                    }
+                    if ui.button("Reset View").clicked() {
+                        Self::reset_zoom_pan_state(&mut self.presenter_zoom_pan);
+                        Self::reset_zoom_pan_state(&mut self.projector_zoom_pan);
+                    }
+                    if ui.button("Performance").clicked() {
+                        self.performance_panel_open = true;
+                    }
+                    ui.separator();
+                    ui.label(RichText::new("Theme").color(palette.text_secondary));
+                    let mut theme_changed = false;
+                    egui::ComboBox::from_id_salt("app_theme")
+                        .selected_text(theme_label(self.config.theme))
+                        .show_ui(ui, |ui| {
+                            theme_changed |= ui
+                                .selectable_value(&mut self.config.theme, AppTheme::Dark, "Dark")
+                                .changed();
+                            theme_changed |= ui
+                                .selectable_value(&mut self.config.theme, AppTheme::Light, "Light")
+                                .changed();
+                            theme_changed |= ui
+                                .selectable_value(
+                                    &mut self.config.theme,
+                                    AppTheme::ProjectorSafe,
+                                    "Projector-safe",
+                                )
+                                .changed();
+                        });
+                    if theme_changed {
+                        install_visual_style(ctx, self.config.theme);
+                        self.persist_config();
+                    }
+                });
             });
 
-            ui.horizontal(|ui| {
-                if ui.button("Prev").clicked() {
-                    self.apply_command(AppCommand::PreviousSlide);
-                }
-                if ui.button("Next").clicked() {
-                    self.apply_command(AppCommand::NextSlide);
-                }
-                if ui.button("First").clicked() {
-                    self.apply_command(AppCommand::FirstSlide);
-                }
-                if ui.button("Last").clicked() {
-                    self.apply_command(AppCommand::LastSlide);
-                }
-                if ui.button("Swap Screens (S)").clicked() {
-                    self.apply_command(AppCommand::SwapScreens);
-                }
-                if ui.button("Toggle Fullscreen (F)").clicked() {
-                    self.apply_command(AppCommand::ToggleProjectorFullscreen);
-                    self.persist_config();
-                }
-                if ui.button("Save (Ctrl+S)").clicked() {
-                    self.save_document_in_place();
-                }
-                if ui.button("Timing (B)").clicked() {
-                    self.timing_breakdown.toggle();
-                }
-                if ui.button("Reset Zoom/Pan").clicked() {
-                    Self::reset_zoom_pan_state(&mut self.presenter_zoom_pan);
-                    Self::reset_zoom_pan_state(&mut self.projector_zoom_pan);
-                }
-                if ui.button("Performance").clicked() {
-                    self.performance_panel_open = true;
-                }
-            });
-        });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(palette.app_background))
+            .show(ctx, |ui| {
             let available = ui.available_size();
             let left_width = available.x * 0.60;
             let right_width = (available.x - left_width - 8.0).max(280.0);
@@ -4908,11 +4916,11 @@ impl PresenterApp {
                     Vec2::new(left_width.max(320.0), available.y),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        ui.group(|ui| {
-                            ui.heading("Notes");
-                            ui.label(self.notes_text());
+                        self.card_frame().show(ui, |ui| {
+                            section_title(ui, palette, "Notes", Some("speaker view"));
+                            quiet_label(ui, palette, self.notes_text());
                             if let Some(warning) = &self.layout_warning {
-                                ui.colored_label(Color32::YELLOW, warning);
+                                ui.colored_label(palette.warning, warning);
                             }
                             let mut override_changed = false;
                             ui.horizontal_wrapped(|ui| {
@@ -5045,13 +5053,36 @@ impl PresenterApp {
                                 self.sync_override_to_config();
                             }
                             ui.separator();
-                            if let Some(texture) = self.notes_texture.as_ref() {
-                                let max = ui.available_size_before_wrap();
-                                let target = Self::fit_size(texture.size_vec2(), max);
-                                ui.image((texture.id(), target));
+                            self.inset_frame().show(ui, |ui| {
+                                if let Some(texture) = self.notes_texture.as_ref() {
+                                    let max = ui.available_size_before_wrap();
+                                    let target = Self::fit_size(texture.size_vec2(), max);
+                                    let response = ui.image((texture.id(), target));
+                                    if self.notes_texture_pending {
+                                        let label = if self.notes_texture_low_res {
+                                            "Sharpening notes"
+                                        } else {
+                                            "Rendering notes"
+                                        };
+                                        Self::draw_rendering_overlay(
+                                            ui,
+                                            response.rect,
+                                            palette,
+                                            label,
+                                        );
+                                    }
                             } else {
-                                ui.label("No notes region detected.");
+                                quiet_label(
+                                    ui,
+                                    palette,
+                                    if self.notes_texture_pending {
+                                        "Rendering notes..."
+                                    } else {
+                                        "No notes region detected."
+                                    },
+                                );
                             }
+                            });
                         });
                     },
                 );
@@ -5066,8 +5097,8 @@ impl PresenterApp {
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
 
-                        ui.group(|ui| {
-                            ui.heading("Current slide");
+                        self.card_frame().show(ui, |ui| {
+                            section_title(ui, palette, "Current Slide", Some("live controls"));
                             if let Some(texture) = self.current_texture.as_ref() {
                                 let viewport_size = Vec2::new(ui.available_width(), preview_height);
                                 let (response, image_rect, reset_requested) =
@@ -5077,6 +5108,7 @@ impl PresenterApp {
                                         texture,
                                         viewport_size,
                                         &mut self.presenter_zoom_pan,
+                                        palette,
                                     );
                                 if reset_requested {
                                     self.status_message = Some("Presenter view reset.".to_owned());
@@ -5122,58 +5154,106 @@ impl PresenterApp {
                                     self.presenter_zoom_pan.zoom * 100.0
                                 ));
                             } else {
-                                ui.label("No rendered current slide.");
+                                quiet_label(ui, palette, "No rendered current slide.");
                             }
                         });
 
                         ui.add_space(6.0);
-                        ui.group(|ui| {
-                            ui.heading("Next slide");
+                        self.card_frame().show(ui, |ui| {
+                            section_title(ui, palette, "Next Slide", Some("upcoming"));
                             if let Some(texture) = self.next_texture.as_ref() {
                                 let max = Vec2::new(ui.available_width(), preview_height);
                                 let target = Self::fit_size(texture.size_vec2(), max);
-                                ui.image((texture.id(), target));
+                                let response = ui.image((texture.id(), target));
+                                if self.next_texture_pending {
+                                    let label = if self.next_texture_low_res {
+                                        "Sharpening next"
+                                    } else {
+                                        "Rendering next"
+                                    };
+                                    Self::draw_rendering_overlay(
+                                        ui,
+                                        response.rect,
+                                        palette,
+                                        label,
+                                    );
+                                }
                             } else {
-                                ui.label("No next slide.");
+                                quiet_label(
+                                    ui,
+                                    palette,
+                                    if self.next_texture_pending {
+                                        "Rendering next slide..."
+                                    } else {
+                                        "No next slide."
+                                    },
+                                );
                             }
                         });
 
                         ui.add_space(6.0);
-                        ui.group(|ui| {
+                        self.card_frame().show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                section_title(ui, palette, "Navigator", None);
+                                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                    ui.label(RichText::new(wall_clock.as_str()).monospace());
+                                });
+                            });
                             ui.horizontal(|ui| {
                                 ui.label("Go To");
-                                ui.text_edit_singleline(&mut self.go_to_input);
-                                if ui.button("Go (G)").clicked() {
+                                ui.add_sized(
+                                    Vec2::new(90.0, 28.0),
+                                    egui::TextEdit::singleline(&mut self.go_to_input),
+                                );
+                                if ui.button("Go").clicked() {
                                     self.submit_go_to();
                                 }
                             });
-                            ui.label(if self.state.use_slide_labels() {
+                            quiet_label(ui, palette, if self.state.use_slide_labels() {
                                 "Mode: slide label (J to toggle)"
                             } else {
                                 "Mode: page number (J to toggle)"
                             });
                             ui.separator();
-                            ui.label(format!(
-                                "{} / {}",
-                                display_index + 1,
-                                self.state.total_slides()
-                            ));
-                            ui.label(format!(
-                                "Label: {}",
-                                self.state.label_at(display_index).unwrap_or("N/A")
-                            ));
-                            ui.label(format!(
-                                "Next: {}",
-                                self.state
-                                    .next_label_from(display_index)
-                                    .unwrap_or("End of deck")
-                            ));
-                            ui.label(format!("Talk Time: {talk_elapsed}"));
-                            ui.label(format!("Slide Time: {slide_elapsed}"));
-                            ui.label(format!("Wall Clock: {wall_clock}"));
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} / {}",
+                                        display_index + 1,
+                                        self.state.total_slides()
+                                    ))
+                                    .font(FontId::new(24.0, FontFamily::Proportional))
+                                    .strong()
+                                    .color(palette.text_primary),
+                                );
+                                ui.separator();
+                                quiet_label(ui, palette, format!(
+                                    "Label {}",
+                                    self.state.label_at(display_index).unwrap_or("N/A")
+                                ));
+                                ui.separator();
+                                quiet_label(ui, palette, format!(
+                                    "Next {}",
+                                    self.state
+                                        .next_label_from(display_index)
+                                        .unwrap_or("End of deck")
+                                ));
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(pill_text(
+                                    format!("Talk {talk_elapsed}"),
+                                    palette.talk_pill,
+                                    palette.talk_pill_text,
+                                ));
+                                ui.label(pill_text(
+                                    format!("Slide {slide_elapsed}"),
+                                    palette.slide_pill,
+                                    palette.slide_pill_text,
+                                ));
+                            });
 
                             ui.separator();
-                            ui.heading("Auto-Advance");
+                            section_title(ui, palette, "Auto-Advance", None);
                             ui.horizontal(|ui| {
                                 let enabled = self.state.auto_advance_enabled();
                                 if ui
@@ -5237,14 +5317,14 @@ impl PresenterApp {
                                 .auto_advance_remaining(Instant::now())
                                 .map(Self::format_duration)
                                 .unwrap_or_else(|| "--:--:--".to_owned());
-                            ui.label(format!("Effective interval: {effective}s"));
-                            ui.label(format!("Next advance in: {countdown}"));
+                            quiet_label(ui, palette, format!("Effective interval: {effective}s"));
+                            quiet_label(ui, palette, format!("Next advance in: {countdown}"));
                         });
 
                         ui.add_space(6.0);
-                        ui.group(|ui| {
-                            ui.heading("Annotations");
-                            ui.label("Laser: hold Ctrl+click/drag for temporary pointer, or press L for persistent pointer.");
+                        self.card_frame().show(ui, |ui| {
+                            section_title(ui, palette, "Annotations", Some("pen and PDF notes"));
+                            quiet_label(ui, palette, "Laser: hold Ctrl+click/drag for temporary pointer, or press L for persistent pointer.");
                             ui.horizontal(|ui| {
                                 let draw_selected =
                                     self.interaction_mode() == InteractionMode::HighlightDraw;
@@ -5280,10 +5360,7 @@ impl PresenterApp {
                             self.render_pen_toolkit_controls(ui, false, display_index);
 
                             if self.document_dirty() {
-                                ui.colored_label(
-                                    Color32::from_rgb(255, 220, 90),
-                                    "Unsaved annotation changes",
-                                );
+                                ui.colored_label(palette.warning, "Unsaved annotation changes");
                             }
 
                             if self.interaction_mode() == InteractionMode::AnnotationEdit {
@@ -5444,7 +5521,7 @@ impl PresenterApp {
                                         let metadata_dirty = self.selected_metadata_dirty();
                                         if transform_dirty {
                                             ui.colored_label(
-                                                Color32::from_rgb(180, 220, 255),
+                                                palette.accent,
                                                 "Geometry changed on canvas. Apply or revert before save.",
                                             );
                                         }
@@ -5716,13 +5793,13 @@ impl PresenterApp {
 
             if let Some(status) = &self.status_message {
                 ui.separator();
-                ui.colored_label(Color32::LIGHT_GREEN, status);
+                ui.colored_label(palette.accent, status);
             }
             if let Some(warning) = &self.keybinding_warning {
-                ui.colored_label(Color32::from_rgb(255, 220, 90), warning);
+                ui.colored_label(palette.warning, warning);
             }
             if let Some(error) = &self.open_error {
-                ui.colored_label(Color32::LIGHT_RED, error);
+                ui.colored_label(palette.danger, error);
             }
         });
 
@@ -5759,6 +5836,7 @@ impl eframe::App for PresenterApp {
         self.apply_overview_commit();
         self.refresh_document_if_changed();
         self.run_auto_advance_tick();
+        self.apply_background_render_results(ctx);
         self.refresh_textures(ctx);
 
         let root_title = if self.state.screen_roles_swapped {
@@ -5773,7 +5851,12 @@ impl eframe::App for PresenterApp {
         self.render_unsaved_changes_dialog(ctx);
         self.render_unsaved_toast(ctx);
         self.finish_laser_frame(ctx);
-        ctx.request_repaint_after(Duration::from_millis(100));
+        let repaint_delay = if self.render_worker.has_pending_work() {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_millis(100)
+        };
+        ctx.request_repaint_after(repaint_delay);
     }
 }
 

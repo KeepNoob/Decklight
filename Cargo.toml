@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+crossbeam-channel = "0.5"
 directories = "6.0"
 eframe = { version = "0.33", default-features = true }
 egui = "0.33"
