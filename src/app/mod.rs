@@ -41,7 +41,7 @@ use eframe::egui::{
     Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, Vec2, ViewportBuilder,
     ViewportId,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -181,6 +181,7 @@ impl PresenterApp {
             layout_reason: None,
             layout_warning: None,
             deck_overview: DeckOverviewState::default(),
+            overview_texture_keys: BTreeSet::new(),
             annotation_edit_enabled: false,
             pending_text_annotation: String::new(),
             text_annotations: Vec::new(),
@@ -353,11 +354,11 @@ impl PresenterApp {
         }
 
         let bytes_per_mb = 1024.0 * 1024.0;
-        let used_mb = self.texture_cache.total_weight_bytes() as f32 / bytes_per_mb;
+        let used_mb = self.logical_resident_texture_bytes() as f32 / bytes_per_mb;
         let budget_mb = self.texture_cache.max_weight_bytes() as f32 / bytes_per_mb;
         ui.add_space(4.0);
         ui.monospace(format!(
-            "Texture cache: {} entries, {:.1} MB / {:.1} MB",
+            "Logical resident estimate (cache + active uncached; not exact VRAM): {} cache entries, {:.1} MB / {:.1} MB",
             self.texture_cache.len(),
             used_mb,
             budget_mb
@@ -674,7 +675,55 @@ impl PresenterApp {
         Self::cache_budget_bytes_for(&self.config)
     }
 
-    fn clear_overview_textures(&mut self) {}
+    fn logical_resident_texture_bytes(&self) -> usize {
+        let mut bytes = self.texture_cache.total_weight_bytes();
+        let mut uncached_texture_ids = HashSet::new();
+        let active_textures = [
+            (
+                self.projector_texture.as_ref(),
+                self.projector_low_res_texture_key
+                    .or(self.projector_texture_key),
+            ),
+            (
+                self.current_texture.as_ref(),
+                self.current_low_res_texture_key
+                    .or(self.current_texture_key),
+            ),
+            (
+                self.presenter_texture.as_ref(),
+                self.presenter_low_res_texture_key
+                    .or(self.presenter_texture_key),
+            ),
+            (
+                self.notes_texture.as_ref(),
+                self.notes_low_res_texture_key.or(self.notes_texture_key),
+            ),
+            (
+                self.next_texture.as_ref(),
+                self.next_low_res_texture_key.or(self.next_texture_key),
+            ),
+        ];
+
+        for (texture, key) in active_textures {
+            let Some(texture) = texture else {
+                continue;
+            };
+            if key.is_none_or(|cache_key| !self.texture_cache.contains(cache_key))
+                && uncached_texture_ids.insert(texture.id())
+            {
+                bytes = bytes.saturating_add(texture.byte_size());
+            }
+        }
+
+        bytes
+    }
+
+    fn clear_overview_textures(&mut self) {
+        let overview_keys = std::mem::take(&mut self.overview_texture_keys);
+        for key in overview_keys {
+            drop(self.texture_cache.remove(key));
+        }
+    }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let typing_in_text_field = ctx.egui_wants_keyboard_input();
@@ -1008,7 +1057,6 @@ impl PresenterApp {
         self.non_highlight_unsaved_changes = false;
         self.pending_unsaved_action = None;
         self.allow_close_without_guard = false;
-        self.render_document_generation = self.render_document_generation.wrapping_add(1);
         self.invalidate_render_cache();
         self.defer_non_critical_texture_refresh(Duration::from_millis(160));
         self.status_message = Some(format!(
@@ -1033,6 +1081,7 @@ impl PresenterApp {
         if self.state.apply(command, now) {
             let changed_slide = self.state.current_index() != previous_index;
             if changed_slide {
+                self.advance_render_generation();
                 self.text_annotation_cache_index = None;
                 self.selected_annotation_id = None;
                 self.active_text_transform = None;
@@ -1088,6 +1137,7 @@ impl PresenterApp {
 
         let now = Instant::now();
         if self.state.maybe_auto_advance(now) {
+            self.advance_render_generation();
             self.text_annotation_cache_index = None;
             self.selected_annotation_id = None;
             self.active_text_transform = None;
@@ -3304,7 +3354,6 @@ impl PresenterApp {
                 self.eraser_erased_in_drag.clear();
                 self.eraser_removed_this_drag = false;
                 self.non_highlight_unsaved_changes = false;
-                self.render_document_generation = self.render_document_generation.wrapping_add(1);
                 self.invalidate_render_cache();
                 self.status_message = Some("PDF reloaded after file change.".to_owned());
             }
@@ -3321,29 +3370,117 @@ impl PresenterApp {
         }
     }
 
+    fn clear_critical_texture(&mut self, slot: CriticalTextureSlot) {
+        let (target_key, low_res_key) = match slot {
+            CriticalTextureSlot::Projector => (
+                self.projector_texture_key,
+                self.projector_low_res_texture_key,
+            ),
+            CriticalTextureSlot::Current => {
+                (self.current_texture_key, self.current_low_res_texture_key)
+            }
+        };
+        match slot {
+            CriticalTextureSlot::Projector => {
+                self.projector_texture = None;
+                self.projector_texture_key = None;
+                self.projector_low_res_texture_key = None;
+            }
+            CriticalTextureSlot::Current => {
+                self.current_texture = None;
+                self.current_texture_key = None;
+                self.current_low_res_texture_key = None;
+            }
+        }
+        for key in [target_key, low_res_key].into_iter().flatten() {
+            self.remove_cached_texture_if_unused(key);
+        }
+    }
+
+    fn clear_secondary_texture(&mut self, slot: SecondaryTextureSlot) {
+        let (target_key, low_res_key) = match slot {
+            SecondaryTextureSlot::Presenter => (
+                self.presenter_texture_key,
+                self.presenter_low_res_texture_key,
+            ),
+            SecondaryTextureSlot::Notes => (self.notes_texture_key, self.notes_low_res_texture_key),
+            SecondaryTextureSlot::Next => (self.next_texture_key, self.next_low_res_texture_key),
+        };
+        match slot {
+            SecondaryTextureSlot::Presenter => {
+                self.presenter_texture = None;
+                self.presenter_texture_key = None;
+                self.presenter_texture_pending = false;
+                self.presenter_texture_low_res = false;
+                self.presenter_low_res_texture_key = None;
+            }
+            SecondaryTextureSlot::Notes => {
+                self.notes_texture = None;
+                self.notes_texture_key = None;
+                self.notes_texture_pending = false;
+                self.notes_texture_low_res = false;
+                self.notes_low_res_texture_key = None;
+            }
+            SecondaryTextureSlot::Next => {
+                self.next_texture = None;
+                self.next_texture_key = None;
+                self.next_texture_pending = false;
+                self.next_texture_low_res = false;
+                self.next_low_res_texture_key = None;
+            }
+        }
+        for key in [target_key, low_res_key].into_iter().flatten() {
+            self.remove_cached_texture_if_unused(key);
+        }
+    }
+
+    fn texture_key_is_active_or_demanded(&self, key: usize) -> bool {
+        [
+            self.projector_texture_key,
+            self.current_texture_key,
+            self.presenter_texture_key,
+            self.notes_texture_key,
+            self.next_texture_key,
+            self.projector_low_res_texture_key,
+            self.current_low_res_texture_key,
+            self.presenter_low_res_texture_key,
+            self.notes_low_res_texture_key,
+            self.next_low_res_texture_key,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|active_key| active_key == key)
+    }
+
+    fn remove_cached_texture_if_unused(&mut self, key: usize) {
+        if !self.texture_key_is_active_or_demanded(key) {
+            drop(self.texture_cache.remove(key));
+        }
+    }
+
+    fn clear_all_active_textures(&mut self) {
+        self.clear_critical_texture(CriticalTextureSlot::Projector);
+        self.clear_critical_texture(CriticalTextureSlot::Current);
+        self.clear_secondary_texture(SecondaryTextureSlot::Presenter);
+        self.clear_secondary_texture(SecondaryTextureSlot::Notes);
+        self.clear_secondary_texture(SecondaryTextureSlot::Next);
+    }
+
     fn invalidate_render_cache(&mut self) {
-        self.texture_cache = PageCache::new(self.config.cache_size, self.cache_budget_bytes());
-        self.projector_texture_key = None;
-        self.current_texture_key = None;
-        self.projector_low_res_texture_key = None;
-        self.current_low_res_texture_key = None;
-        self.presenter_texture_key = None;
-        self.notes_texture_key = None;
-        self.next_texture_key = None;
-        self.presenter_texture_pending = false;
-        self.notes_texture_pending = false;
-        self.next_texture_pending = false;
-        self.presenter_texture_low_res = false;
-        self.notes_texture_low_res = false;
-        self.next_texture_low_res = false;
-        self.presenter_low_res_texture_key = None;
-        self.notes_low_res_texture_key = None;
-        self.next_low_res_texture_key = None;
+        self.advance_render_generation();
+        self.clear_all_active_textures();
         self.clear_overview_textures();
+        self.texture_cache = PageCache::new(self.config.cache_size, self.cache_budget_bytes());
         self.reset_layout_resolution();
         self.text_annotation_cache_index = None;
         self.original_text_annotations.clear();
         self.active_text_transform = None;
+    }
+
+    fn advance_render_generation(&mut self) {
+        self.render_document_generation = self.render_document_generation.wrapping_add(1);
+        self.render_worker
+            .set_latest_generation(self.render_document_generation);
     }
 
     fn defer_non_critical_texture_refresh(&mut self, duration: Duration) {
@@ -3428,6 +3565,94 @@ impl PresenterApp {
             .wrapping_mul(131)
             .wrapping_add(Self::layout_cache_id(self.active_override_layout()));
         key
+    }
+
+    fn shared_slide_only_width(projector_width: usize, presenter_width: usize) -> usize {
+        projector_width.max(presenter_width)
+    }
+
+    fn slide_only_demands_match(
+        projector_index: usize,
+        projector_layout: Option<NotesLayout>,
+        presenter_index: usize,
+        presenter_layout: Option<NotesLayout>,
+    ) -> bool {
+        projector_index == presenter_index && projector_layout == presenter_layout
+    }
+
+    fn texture_slot_is_ready(
+        texture: &Option<TextureHandle>,
+        target_key: Option<usize>,
+        desired_key: Option<usize>,
+        low_res_key: Option<usize>,
+        pending: bool,
+    ) -> bool {
+        texture.is_some() && target_key == desired_key && low_res_key.is_none() && !pending
+    }
+
+    fn stale_low_res_key(
+        previous_low_res_key: Option<usize>,
+        incoming_texture_key: Option<usize>,
+    ) -> Option<usize> {
+        previous_low_res_key.filter(|key| Some(*key) != incoming_texture_key)
+    }
+
+    fn overview_result_is_current(
+        overview_is_open: bool,
+        overview_texture_keys: &BTreeSet<usize>,
+        cache_key: usize,
+    ) -> bool {
+        overview_is_open && overview_texture_keys.contains(&cache_key)
+    }
+
+    fn critical_textures_ready(
+        &self,
+        screen_roles_swapped: bool,
+        projector_target_key: Option<usize>,
+        current_target_key: Option<usize>,
+    ) -> bool {
+        let projector_ready = if screen_roles_swapped {
+            Self::texture_slot_is_ready(
+                &self.presenter_texture,
+                self.presenter_texture_key,
+                projector_target_key,
+                self.presenter_low_res_texture_key,
+                self.presenter_texture_pending,
+            )
+        } else {
+            Self::texture_slot_is_ready(
+                &self.projector_texture,
+                self.projector_texture_key,
+                projector_target_key,
+                self.projector_low_res_texture_key,
+                false,
+            )
+        };
+        let current_ready = Self::texture_slot_is_ready(
+            &self.current_texture,
+            self.current_texture_key,
+            current_target_key,
+            self.current_low_res_texture_key,
+            false,
+        );
+        projector_ready && current_ready
+    }
+
+    fn render_pressure_is_low(&self) -> bool {
+        let entries_low = self.texture_cache.len().saturating_mul(4)
+            <= self.texture_cache.capacity().saturating_mul(3);
+        let bytes_low = self.logical_resident_texture_bytes().saturating_mul(4)
+            <= self.texture_cache.max_weight_bytes().saturating_mul(3);
+        !self.render_worker.has_pending_work() && entries_low && bytes_low
+    }
+
+    fn next_texture_satisfies_prefetch(
+        prefetch_width: usize,
+        visible_next_width: usize,
+        visible_next_demanded: bool,
+        prefetch_key_cached: bool,
+    ) -> bool {
+        prefetch_key_cached || (visible_next_width >= prefetch_width && visible_next_demanded)
     }
 
     fn texture_cache_key(
@@ -3644,7 +3869,6 @@ impl PresenterApp {
         namespace: usize,
         bitmap: crate::document::PageBitmap,
     ) -> TextureHandle {
-        let byte_estimate = bitmap.rgba.len();
         let image =
             egui::ColorImage::from_rgba_unmultiplied([bitmap.width, bitmap.height], &bitmap.rgba);
         let texture = ctx.load_texture(
@@ -3652,6 +3876,7 @@ impl PresenterApp {
             image,
             TextureOptions::LINEAR,
         );
+        let byte_estimate = texture.byte_size();
 
         self.texture_cache.put(
             key,
@@ -3672,6 +3897,15 @@ impl PresenterApp {
                     namespace,
                     bitmap,
                 } => {
+                    if namespace == 2
+                        && !Self::overview_result_is_current(
+                            self.deck_overview.is_open,
+                            &self.overview_texture_keys,
+                            key.cache_key,
+                        )
+                    {
+                        continue;
+                    }
                     if key.document_generation != self.render_document_generation {
                         continue;
                     }
@@ -3680,6 +3914,7 @@ impl PresenterApp {
                     }
                     applied_result = true;
                 }
+                RenderResult::Cancelled { .. } => {}
                 RenderResult::Failed { key, message } => {
                     if key.document_generation == self.render_document_generation {
                         self.open_error = Some(message);
@@ -3770,9 +4005,11 @@ impl PresenterApp {
     }
 
     fn refresh_textures(&mut self, ctx: &Context) {
-        let Some(_) = self.document else {
+        if self.document.is_none() {
+            self.clear_all_active_textures();
             return;
-        };
+        }
+
         let projector_width = self.config.projector_render_width;
         let presenter_width = self.config.presenter_render_width;
         let next_width = self.config.next_render_width;
@@ -3785,46 +4022,42 @@ impl PresenterApp {
         } else {
             projector_index
         };
-        let next_index = (presenter_index + 1).min(self.state.total_slides().saturating_sub(1));
-        let projector_layout = self.resolve_layout_for_slide(projector_index);
+        let next_index =
+            (presenter_index + 1 < self.state.total_slides()).then_some(presenter_index + 1);
+        let projector_layout = (!self.state.screen_roles_swapped)
+            .then(|| self.resolve_layout_for_slide(projector_index))
+            .flatten();
         let presenter_layout = self.resolve_layout_for_slide(presenter_index);
-        let next_layout = self.resolve_layout_for_slide(next_index);
+        let next_layout = next_index.and_then(|index| self.resolve_layout_for_slide(index));
         let non_critical_refresh_ready = self.non_critical_texture_refresh_ready();
-
-        if Self::has_visible_region(projector_layout, PageView::SlideOnly) {
-            match self.get_or_render_texture(
-                ctx,
+        let projector_slide_needed = !self.state.screen_roles_swapped
+            && Self::has_visible_region(projector_layout, PageView::SlideOnly);
+        let current_slide_needed = Self::has_visible_region(presenter_layout, PageView::SlideOnly);
+        let can_share_slide_only = projector_slide_needed
+            && current_slide_needed
+            && Self::slide_only_demands_match(
                 projector_index,
-                PageView::SlideOnly,
                 projector_layout,
-                projector_width,
-                1,
-            ) {
-                Ok(progressive_texture) => {
-                    self.update_critical_texture(
-                        progressive_texture,
-                        CriticalTextureSlot::Projector,
-                    );
-                }
-                Err(error) => {
-                    self.open_error = Some(format!("Projector render failed: {error}"));
-                }
-            }
-        } else {
-            self.projector_texture = None;
-            self.projector_texture_key = None;
-        }
+                presenter_index,
+                presenter_layout,
+            );
+        let shared_slide_only_width =
+            Self::shared_slide_only_width(projector_width, presenter_width);
 
-        if Self::has_visible_region(presenter_layout, PageView::SlideOnly) {
+        if can_share_slide_only {
             match self.get_or_render_texture(
                 ctx,
                 presenter_index,
                 PageView::SlideOnly,
                 presenter_layout,
-                presenter_width,
+                shared_slide_only_width,
                 1,
             ) {
                 Ok(progressive_texture) => {
+                    self.update_critical_texture(
+                        progressive_texture.clone(),
+                        CriticalTextureSlot::Projector,
+                    );
                     self.update_critical_texture(progressive_texture, CriticalTextureSlot::Current);
                 }
                 Err(error) => {
@@ -3832,25 +4065,72 @@ impl PresenterApp {
                 }
             }
         } else {
-            self.current_texture = None;
-            self.current_texture_key = None;
+            if projector_slide_needed {
+                match self.get_or_render_texture(
+                    ctx,
+                    projector_index,
+                    PageView::SlideOnly,
+                    projector_layout,
+                    projector_width,
+                    1,
+                ) {
+                    Ok(progressive_texture) => {
+                        self.update_critical_texture(
+                            progressive_texture,
+                            CriticalTextureSlot::Projector,
+                        );
+                    }
+                    Err(error) => {
+                        self.open_error = Some(format!("Projector render failed: {error}"));
+                    }
+                }
+            } else {
+                self.clear_critical_texture(CriticalTextureSlot::Projector);
+            }
+
+            if current_slide_needed {
+                match self.get_or_render_texture(
+                    ctx,
+                    presenter_index,
+                    PageView::SlideOnly,
+                    presenter_layout,
+                    presenter_width,
+                    1,
+                ) {
+                    Ok(progressive_texture) => {
+                        self.update_critical_texture(
+                            progressive_texture,
+                            CriticalTextureSlot::Current,
+                        );
+                    }
+                    Err(error) => {
+                        self.open_error = Some(format!("Current slide render failed: {error}"));
+                    }
+                }
+            } else {
+                self.clear_critical_texture(CriticalTextureSlot::Current);
+            }
         }
 
-        let presenter_texture = self.cached_or_request_texture(
-            presenter_index,
-            PageView::Full,
-            presenter_layout,
-            presenter_width,
-            1,
-            RenderPriority::High,
-        );
-        self.update_secondary_texture(
-            presenter_texture,
-            non_critical_refresh_ready,
-            SecondaryTextureSlot::Presenter,
-        );
+        if self.state.screen_roles_swapped {
+            let presenter_texture = self.cached_or_request_texture(
+                presenter_index,
+                PageView::Full,
+                presenter_layout,
+                presenter_width,
+                1,
+                RenderPriority::High,
+            );
+            self.update_secondary_texture(
+                presenter_texture,
+                non_critical_refresh_ready,
+                SecondaryTextureSlot::Presenter,
+            );
+        } else {
+            self.clear_secondary_texture(SecondaryTextureSlot::Presenter);
+        }
 
-        if next_index != presenter_index
+        if let Some(next_index) = next_index
             && Self::has_visible_region(next_layout, PageView::SlideOnly)
         {
             let next_texture = self.cached_or_request_texture(
@@ -3867,10 +4147,7 @@ impl PresenterApp {
                 SecondaryTextureSlot::Next,
             );
         } else {
-            self.next_texture = None;
-            self.next_texture_key = None;
-            self.next_texture_pending = false;
-            self.next_texture_low_res = false;
+            self.clear_secondary_texture(SecondaryTextureSlot::Next);
         }
 
         if Self::has_visible_region(presenter_layout, PageView::NotesOnly) {
@@ -3888,13 +4165,59 @@ impl PresenterApp {
                 SecondaryTextureSlot::Notes,
             );
         } else {
-            self.notes_texture = None;
-            self.notes_texture_key = None;
-            self.notes_texture_pending = false;
-            self.notes_texture_low_res = false;
+            self.clear_secondary_texture(SecondaryTextureSlot::Notes);
         }
 
-        self.prefetch_adjacent_slide_textures(projector_index);
+        let projector_target_key = if self.state.screen_roles_swapped {
+            Some(Self::texture_cache_key(
+                presenter_index,
+                self.config.notes_mode,
+                PageView::Full,
+                presenter_layout,
+                presenter_width,
+                1,
+            ))
+        } else if projector_slide_needed {
+            let target_width = if can_share_slide_only {
+                shared_slide_only_width
+            } else {
+                projector_width
+            };
+            Some(Self::texture_cache_key(
+                projector_index,
+                self.config.notes_mode,
+                PageView::SlideOnly,
+                projector_layout,
+                target_width,
+                1,
+            ))
+        } else {
+            None
+        };
+        let current_target_key = current_slide_needed.then(|| {
+            Self::texture_cache_key(
+                presenter_index,
+                self.config.notes_mode,
+                PageView::SlideOnly,
+                presenter_layout,
+                if can_share_slide_only {
+                    shared_slide_only_width
+                } else {
+                    presenter_width
+                },
+                1,
+            )
+        });
+        let critical_textures_ready = self.critical_textures_ready(
+            self.state.screen_roles_swapped,
+            projector_target_key,
+            current_target_key,
+        );
+        self.prefetch_adjacent_slide_textures(
+            projector_index,
+            non_critical_refresh_ready,
+            critical_textures_ready,
+        );
     }
 
     fn update_critical_texture(
@@ -3903,22 +4226,30 @@ impl PresenterApp {
         slot: CriticalTextureSlot,
     ) {
         let Some(texture) = progressive_texture.texture else {
+            let current_target_key = match slot {
+                CriticalTextureSlot::Projector => self.projector_texture_key,
+                CriticalTextureSlot::Current => self.current_texture_key,
+            };
+            if current_target_key != Some(progressive_texture.target_key) {
+                self.clear_critical_texture(slot);
+            }
             return;
         };
 
-        let previous_low_res_key = match slot {
-            CriticalTextureSlot::Projector => self.projector_low_res_texture_key,
-            CriticalTextureSlot::Current => self.current_low_res_texture_key,
+        let (previous_target_key, previous_low_res_key) = match slot {
+            CriticalTextureSlot::Projector => (
+                self.projector_texture_key,
+                self.projector_low_res_texture_key,
+            ),
+            CriticalTextureSlot::Current => {
+                (self.current_texture_key, self.current_low_res_texture_key)
+            }
         };
-        let mut low_res_key_to_remove = None;
+        let low_res_key_to_remove =
+            Self::stale_low_res_key(previous_low_res_key, progressive_texture.texture_key);
         let next_low_res_key = if progressive_texture.is_low_res {
             progressive_texture.texture_key
         } else {
-            if let Some(previous_low_res_key) = previous_low_res_key
-                && previous_low_res_key != progressive_texture.target_key
-            {
-                low_res_key_to_remove = Some(previous_low_res_key);
-            }
             None
         };
 
@@ -3935,8 +4266,13 @@ impl PresenterApp {
             }
         }
 
+        if let Some(key) = previous_target_key
+            && key != progressive_texture.target_key
+        {
+            self.remove_cached_texture_if_unused(key);
+        }
         if let Some(key) = low_res_key_to_remove {
-            drop(self.texture_cache.remove(key));
+            self.remove_cached_texture_if_unused(key);
         }
     }
 
@@ -3946,6 +4282,14 @@ impl PresenterApp {
         can_clear_stale_texture: bool,
         slot: SecondaryTextureSlot,
     ) {
+        let (previous_target_key, previous_low_res_key) = match slot {
+            SecondaryTextureSlot::Presenter => (
+                self.presenter_texture_key,
+                self.presenter_low_res_texture_key,
+            ),
+            SecondaryTextureSlot::Notes => (self.notes_texture_key, self.notes_low_res_texture_key),
+            SecondaryTextureSlot::Next => (self.next_texture_key, self.next_low_res_texture_key),
+        };
         let (target_texture, target_key, target_pending, target_low_res) = match slot {
             SecondaryTextureSlot::Presenter => (
                 &mut self.presenter_texture,
@@ -3967,26 +4311,20 @@ impl PresenterApp {
             ),
         };
 
-        let previous_low_res_key = match slot {
-            SecondaryTextureSlot::Presenter => self.presenter_low_res_texture_key,
-            SecondaryTextureSlot::Notes => self.notes_low_res_texture_key,
-            SecondaryTextureSlot::Next => self.next_low_res_texture_key,
-        };
         let mut low_res_key_to_remove = None;
         let mut next_low_res_key = previous_low_res_key;
 
         match progressive_texture.texture {
             Some(texture) => {
+                low_res_key_to_remove =
+                    Self::stale_low_res_key(previous_low_res_key, progressive_texture.texture_key);
                 *target_texture = Some(texture);
                 *target_key = Some(progressive_texture.target_key);
                 *target_pending = progressive_texture.is_low_res;
                 *target_low_res = progressive_texture.is_low_res;
                 if progressive_texture.is_low_res {
                     next_low_res_key = progressive_texture.texture_key;
-                } else if let Some(previous_low_res_key) = previous_low_res_key {
-                    if previous_low_res_key != progressive_texture.target_key {
-                        low_res_key_to_remove = Some(previous_low_res_key);
-                    }
+                } else {
                     next_low_res_key = None;
                 }
             }
@@ -4010,12 +4348,30 @@ impl PresenterApp {
             SecondaryTextureSlot::Notes => self.notes_low_res_texture_key = next_low_res_key,
             SecondaryTextureSlot::Next => self.next_low_res_texture_key = next_low_res_key,
         }
+        if let Some(key) = previous_target_key
+            && key != progressive_texture.target_key
+        {
+            self.remove_cached_texture_if_unused(key);
+        }
         if let Some(key) = low_res_key_to_remove {
-            drop(self.texture_cache.remove(key));
+            self.remove_cached_texture_if_unused(key);
         }
     }
 
-    fn prefetch_adjacent_slide_textures(&mut self, current_index: usize) {
+    fn prefetch_adjacent_slide_textures(
+        &mut self,
+        current_index: usize,
+        non_critical_refresh_ready: bool,
+        critical_textures_ready: bool,
+    ) {
+        if self.deck_overview.is_open
+            || !non_critical_refresh_ready
+            || !critical_textures_ready
+            || !self.render_pressure_is_low()
+        {
+            return;
+        }
+
         let next_index = current_index.saturating_add(1);
         if next_index >= self.state.total_slides() {
             return;
@@ -4026,45 +4382,46 @@ impl PresenterApp {
             return;
         }
 
-        let projector_key = Self::texture_cache_key(
+        let target_width = Self::shared_slide_only_width(
+            self.config.projector_render_width,
+            self.config.presenter_render_width,
+        );
+        let prefetch_key = Self::texture_cache_key(
             next_index,
             self.config.notes_mode,
             PageView::SlideOnly,
             next_layout,
-            self.config.projector_render_width,
+            target_width,
             1,
         );
-        if !self.texture_cache.contains(projector_key) {
-            self.request_background_render(BackgroundRenderRequest {
-                cache_key: projector_key,
-                index: next_index,
-                view: PageView::SlideOnly,
-                layout: next_layout,
-                target_width: self.config.projector_render_width,
-                namespace: 1,
-                priority: RenderPriority::High,
-            });
+        let visible_next_key = Self::texture_cache_key(
+            next_index,
+            self.config.notes_mode,
+            PageView::SlideOnly,
+            next_layout,
+            self.config.next_render_width,
+            1,
+        );
+        let visible_next_demanded = self.next_texture_key == Some(visible_next_key)
+            || self.texture_cache.contains(visible_next_key);
+        if Self::next_texture_satisfies_prefetch(
+            target_width,
+            self.config.next_render_width,
+            visible_next_demanded,
+            self.texture_cache.contains(prefetch_key),
+        ) {
+            return;
         }
 
-        let presenter_key = Self::texture_cache_key(
-            next_index,
-            self.config.notes_mode,
-            PageView::SlideOnly,
-            next_layout,
-            self.config.presenter_render_width,
-            1,
-        );
-        if !self.texture_cache.contains(presenter_key) {
-            self.request_background_render(BackgroundRenderRequest {
-                cache_key: presenter_key,
-                index: next_index,
-                view: PageView::SlideOnly,
-                layout: next_layout,
-                target_width: self.config.presenter_render_width,
-                namespace: 1,
-                priority: RenderPriority::Normal,
-            });
-        }
+        self.request_background_render(BackgroundRenderRequest {
+            cache_key: prefetch_key,
+            index: next_index,
+            view: PageView::SlideOnly,
+            layout: next_layout,
+            target_width,
+            namespace: 1,
+            priority: RenderPriority::Low,
+        });
     }
 
     fn format_duration(duration: Duration) -> String {
@@ -4316,6 +4673,27 @@ impl PresenterApp {
         layout: Option<NotesLayout>,
     ) -> Option<TextureHandle> {
         let target_width = self.config.overview_thumbnail_width;
+        let target_key = Self::texture_cache_key(
+            index,
+            self.config.notes_mode,
+            PageView::SlideOnly,
+            layout,
+            target_width,
+            2,
+        );
+        self.overview_texture_keys.insert(target_key);
+        let low_res_width = Self::low_res_render_width(target_width);
+        if low_res_width < target_width {
+            self.overview_texture_keys.insert(Self::texture_cache_key(
+                index,
+                self.config.notes_mode,
+                PageView::SlideOnly,
+                layout,
+                low_res_width,
+                2,
+            ));
+        }
+
         let progressive_texture = self.cached_or_request_texture(
             index,
             PageView::SlideOnly,
@@ -4333,9 +4711,9 @@ impl PresenterApp {
         }
 
         let mut open = self.deck_overview.is_open;
+        let was_open = self.deck_overview.is_open;
         let total = self.state.total_slides();
         let columns = self.config.overview_columns as usize;
-        let thumb_layout = self.resolve_layout_for_slide(self.presenter_display_index());
         let palette = self.palette();
 
         egui::Window::new("Deck Overview (D)")
@@ -4394,26 +4772,57 @@ impl PresenterApp {
                                     });
                                 frame.show(ui, |ui| {
                                     ui.vertical(|ui| {
-                                        if let Some(texture) =
-                                            self.get_or_render_overview_texture(index, thumb_layout)
-                                        {
-                                            let base_width = self.config.overview_thumbnail_width
-                                                as f32
-                                                * self.deck_overview.thumbnail_scale;
-                                            let size = texture.size_vec2();
-                                            let ratio =
-                                                if size.x > 0.0 { size.y / size.x } else { 1.0 };
-                                            let target = Vec2::new(base_width, base_width * ratio);
-                                            let response = ui.add(
-                                                egui::Image::from_texture((texture.id(), target))
-                                                    .sense(egui::Sense::click()),
+                                        let thumbnail_width = self.config.overview_thumbnail_width
+                                            as f32
+                                            * self.deck_overview.thumbnail_scale;
+                                        let thumbnail_size = Vec2::new(
+                                            thumbnail_width,
+                                            thumbnail_width * 9.0 / 16.0,
+                                        );
+                                        let (thumbnail_rect, thumbnail_response) = ui
+                                            .allocate_exact_size(
+                                                thumbnail_size,
+                                                egui::Sense::click(),
                                             );
-                                            if response.clicked() {
-                                                self.deck_overview.selected_index = index;
-                                                self.deck_overview.commit();
-                                            }
+                                        let thumbnail_visible = ui.is_rect_visible(thumbnail_rect);
+                                        let texture = thumbnail_visible.then(|| {
+                                            let thumbnail_layout =
+                                                self.resolve_layout_for_slide(index);
+                                            self.get_or_render_overview_texture(
+                                                index,
+                                                thumbnail_layout,
+                                            )
+                                        });
+                                        if let Some(texture) = texture.flatten() {
+                                            let image_size = Self::fit_size(
+                                                texture.size_vec2(),
+                                                thumbnail_rect.size(),
+                                            );
+                                            let image_rect = Rect::from_center_size(
+                                                thumbnail_rect.center(),
+                                                image_size,
+                                            );
+                                            ui.painter().image(
+                                                texture.id(),
+                                                image_rect,
+                                                Rect::from_min_max(
+                                                    Pos2::new(0.0, 0.0),
+                                                    Pos2::new(1.0, 1.0),
+                                                ),
+                                                Color32::WHITE,
+                                            );
                                         } else {
-                                            ui.label("Rendering...");
+                                            ui.painter().text(
+                                                thumbnail_rect.center(),
+                                                Align2::CENTER_CENTER,
+                                                "Rendering...",
+                                                FontId::default(),
+                                                palette.text_secondary,
+                                            );
+                                        }
+                                        if thumbnail_response.clicked() {
+                                            self.deck_overview.selected_index = index;
+                                            self.deck_overview.commit();
                                         }
                                         ui.label(format!("Slide {}", index + 1));
                                     });
@@ -4426,7 +4835,9 @@ impl PresenterApp {
                 });
             });
 
-        let was_open = self.deck_overview.is_open;
+        if !self.deck_overview.is_open {
+            open = false;
+        }
         self.deck_overview.is_open = open;
         if was_open && !self.deck_overview.is_open {
             self.clear_overview_textures();
@@ -5919,9 +6330,9 @@ mod overview_tests {
     };
     use crate::app::{AppCommand, PresentationState};
     use crate::config::{KeybindingConfig, NotesLayout, NotesSide, SplitAxis};
-    use crate::document::{AnnotationMetadata, PdfRect, TextAnnotation};
+    use crate::document::{AnnotationMetadata, PageView, PdfRect, TextAnnotation};
     use eframe::egui::{Key, Pos2, Rect, Vec2};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::time::{Duration, Instant};
 
     fn sample_text_annotation(id: &str, rect: PdfRect) -> TextAnnotation {
@@ -5946,6 +6357,108 @@ mod overview_tests {
         assert_eq!(overview.selected_index, 4);
         overview.move_selection(10, 4, 10, 10);
         assert_eq!(overview.selected_index, 9);
+    }
+
+    #[test]
+    fn shared_slide_only_demand_requires_matching_index_and_layout() {
+        let layout = Some(NotesLayout {
+            axis: SplitAxis::Vertical,
+            split_ratio: 0.5,
+            notes_side: NotesSide::Right,
+            confidence: 1.0,
+        });
+
+        assert!(PresenterApp::slide_only_demands_match(2, layout, 2, layout));
+        assert!(!PresenterApp::slide_only_demands_match(
+            2, layout, 3, layout
+        ));
+        assert!(!PresenterApp::slide_only_demands_match(2, layout, 2, None));
+        assert_eq!(PresenterApp::shared_slide_only_width(1280, 960), 1280);
+    }
+
+    #[test]
+    fn stale_low_res_keys_are_removed_only_when_replaced() {
+        assert_eq!(PresenterApp::stale_low_res_key(Some(7), Some(7)), None);
+        assert_eq!(PresenterApp::stale_low_res_key(Some(7), Some(8)), Some(7));
+        assert_eq!(PresenterApp::stale_low_res_key(Some(7), None), Some(7));
+    }
+
+    #[test]
+    fn overview_results_require_an_open_tracked_session() {
+        let mut keys = BTreeSet::new();
+        keys.insert(11);
+
+        assert!(PresenterApp::overview_result_is_current(true, &keys, 11));
+        assert!(!PresenterApp::overview_result_is_current(false, &keys, 11));
+        assert!(!PresenterApp::overview_result_is_current(true, &keys, 12));
+    }
+
+    #[test]
+    fn texture_cache_key_keeps_page_view_layout_and_index_distinct() {
+        let layout = Some(NotesLayout {
+            axis: SplitAxis::Horizontal,
+            split_ratio: 0.4,
+            notes_side: NotesSide::Top,
+            confidence: 1.0,
+        });
+        let slide_key = PresenterApp::texture_cache_key(
+            2,
+            crate::config::NotesMode::Auto,
+            PageView::SlideOnly,
+            layout,
+            1280,
+            1,
+        );
+
+        assert_ne!(
+            slide_key,
+            PresenterApp::texture_cache_key(
+                2,
+                crate::config::NotesMode::Auto,
+                PageView::NotesOnly,
+                layout,
+                1280,
+                1,
+            )
+        );
+        assert_ne!(
+            slide_key,
+            PresenterApp::texture_cache_key(
+                3,
+                crate::config::NotesMode::Auto,
+                PageView::SlideOnly,
+                layout,
+                1280,
+                1,
+            )
+        );
+        assert_ne!(
+            slide_key,
+            PresenterApp::texture_cache_key(
+                2,
+                crate::config::NotesMode::Auto,
+                PageView::SlideOnly,
+                None,
+                1280,
+                1,
+            )
+        );
+    }
+
+    #[test]
+    fn prefetch_skips_an_equal_or_larger_demand() {
+        assert!(PresenterApp::next_texture_satisfies_prefetch(
+            960, 960, true, false
+        ));
+        assert!(!PresenterApp::next_texture_satisfies_prefetch(
+            960, 1280, false, false
+        ));
+        assert!(!PresenterApp::next_texture_satisfies_prefetch(
+            1280, 960, true, false
+        ));
+        assert!(PresenterApp::next_texture_satisfies_prefetch(
+            1280, 640, false, true
+        ));
     }
 
     #[test]

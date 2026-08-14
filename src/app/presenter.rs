@@ -70,6 +70,7 @@ pub(super) struct PresenterApp {
     pub(super) layout_reason: Option<String>,
     pub(super) layout_warning: Option<String>,
     pub(super) deck_overview: DeckOverviewState,
+    pub(super) overview_texture_keys: BTreeSet<usize>,
     pub(super) annotation_edit_enabled: bool,
     pub(super) pending_text_annotation: String,
     pub(super) text_annotations: Vec<TextAnnotation>,

@@ -1,3 +1,4 @@
+use super::pdfium_renderer::render_page_bitmap_from_path;
 use super::pdfium_runtime::with_pdfium;
 use crate::config::{NotesLayout, NotesMode, NotesSide, SplitAxis};
 use crate::document::{
@@ -5,7 +6,6 @@ use crate::document::{
     PageGeometry, PageView, TextAnnotation,
 };
 use anyhow::{Context, Result, bail};
-use pdfium_render::prelude::PdfRenderConfig;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -52,227 +52,6 @@ impl PdfiumFallbackBackend {
         index
             .try_into()
             .map_err(|_| anyhow::anyhow!("page index out of range for PDFium: {index}"))
-    }
-
-    fn crop_vertical(
-        rgba: &[u8],
-        width: usize,
-        height: usize,
-        from_x: usize,
-        to_x: usize,
-    ) -> PageBitmap {
-        if width == 0 || height == 0 {
-            return PageBitmap {
-                width: 1,
-                height: 1,
-                rgba: vec![255_u8; 4],
-            };
-        }
-
-        let left = from_x.min(width - 1);
-        let right = to_x.min(width).max(left + 1).min(width);
-        let cropped_width = right - left;
-        let mut cropped = vec![0_u8; cropped_width * height * 4];
-
-        for row in 0..height {
-            let src_start = row * width * 4 + left * 4;
-            let src_end = row * width * 4 + right * 4;
-            let dst_start = row * cropped_width * 4;
-            let dst_end = dst_start + cropped_width * 4;
-            cropped[dst_start..dst_end].copy_from_slice(&rgba[src_start..src_end]);
-        }
-
-        PageBitmap {
-            width: cropped_width,
-            height,
-            rgba: cropped,
-        }
-    }
-
-    fn crop_horizontal(
-        rgba: &[u8],
-        width: usize,
-        height: usize,
-        from_y: usize,
-        to_y: usize,
-    ) -> PageBitmap {
-        if width == 0 || height == 0 {
-            return PageBitmap {
-                width: 1,
-                height: 1,
-                rgba: vec![255_u8; 4],
-            };
-        }
-
-        let top = from_y.min(height - 1);
-        let bottom = to_y.min(height).max(top + 1).min(height);
-        let cropped_height = bottom - top;
-        let mut cropped = vec![0_u8; width * cropped_height * 4];
-
-        for row in 0..cropped_height {
-            let src_row = top + row;
-            let src_start = src_row * width * 4;
-            let src_end = src_start + width * 4;
-            let dst_start = row * width * 4;
-            let dst_end = dst_start + width * 4;
-            cropped[dst_start..dst_end].copy_from_slice(&rgba[src_start..src_end]);
-        }
-
-        PageBitmap {
-            width,
-            height: cropped_height,
-            rgba: cropped,
-        }
-    }
-
-    fn crop_by_layout(full: &PageBitmap, layout: NotesLayout, view: PageView) -> PageBitmap {
-        if view == PageView::Full {
-            return full.clone();
-        }
-
-        let split_ratio = layout.split_ratio.clamp(0.0, 1.0);
-        match layout.axis {
-            SplitAxis::Vertical => {
-                let split_x = ((full.width as f32) * split_ratio).round() as usize;
-                let (notes_from, notes_to) = match layout.notes_side {
-                    NotesSide::Left => (0usize, split_x),
-                    NotesSide::Right => (split_x, full.width),
-                    NotesSide::Top | NotesSide::Bottom => (split_x, full.width),
-                };
-                let (slide_from, slide_to) = if matches!(layout.notes_side, NotesSide::Left) {
-                    (split_x, full.width)
-                } else {
-                    (0usize, split_x)
-                };
-
-                match view {
-                    PageView::SlideOnly => Self::crop_vertical(
-                        &full.rgba,
-                        full.width,
-                        full.height,
-                        slide_from,
-                        slide_to,
-                    ),
-                    PageView::NotesOnly => Self::crop_vertical(
-                        &full.rgba,
-                        full.width,
-                        full.height,
-                        notes_from,
-                        notes_to,
-                    ),
-                    PageView::Full => full.clone(),
-                }
-            }
-            SplitAxis::Horizontal => {
-                let split_y = ((full.height as f32) * split_ratio).round() as usize;
-                let (notes_from, notes_to) = match layout.notes_side {
-                    NotesSide::Top => (0usize, split_y),
-                    NotesSide::Bottom => (split_y, full.height),
-                    NotesSide::Left | NotesSide::Right => (split_y, full.height),
-                };
-                let (slide_from, slide_to) = if matches!(layout.notes_side, NotesSide::Top) {
-                    (split_y, full.height)
-                } else {
-                    (0usize, split_y)
-                };
-
-                match view {
-                    PageView::SlideOnly => Self::crop_horizontal(
-                        &full.rgba,
-                        full.width,
-                        full.height,
-                        slide_from,
-                        slide_to,
-                    ),
-                    PageView::NotesOnly => Self::crop_horizontal(
-                        &full.rgba,
-                        full.width,
-                        full.height,
-                        notes_from,
-                        notes_to,
-                    ),
-                    PageView::Full => full.clone(),
-                }
-            }
-        }
-    }
-
-    fn view_scale_factor(view: PageView, layout: Option<NotesLayout>) -> f32 {
-        let Some(layout) = layout else {
-            return 1.0;
-        };
-        if view == PageView::Full {
-            return 1.0;
-        }
-
-        let split = layout.split_ratio.clamp(0.0, 1.0);
-        let (fraction_x, fraction_y) = match layout.axis {
-            SplitAxis::Vertical => {
-                let notes_fraction = if layout.notes_side == NotesSide::Left {
-                    split
-                } else {
-                    1.0 - split
-                };
-                let slide_fraction = 1.0 - notes_fraction;
-                let selected = if view == PageView::NotesOnly {
-                    notes_fraction
-                } else {
-                    slide_fraction
-                };
-                (selected, 1.0)
-            }
-            SplitAxis::Horizontal => {
-                let notes_fraction = if layout.notes_side == NotesSide::Top {
-                    split
-                } else {
-                    1.0 - split
-                };
-                let slide_fraction = 1.0 - notes_fraction;
-                let selected = if view == PageView::NotesOnly {
-                    notes_fraction
-                } else {
-                    slide_fraction
-                };
-                (1.0, selected)
-            }
-        };
-
-        let min_fraction = fraction_x.min(fraction_y).clamp(0.1, 1.0);
-        (1.0 / min_fraction).clamp(1.0, 3.0)
-    }
-
-    fn effective_render_width(
-        target_width: usize,
-        view: PageView,
-        layout: Option<NotesLayout>,
-    ) -> usize {
-        let base = target_width.clamp(200, 4096) as f32;
-        let scale = Self::view_scale_factor(view, layout);
-        (base * scale).round().clamp(200.0, 4096.0) as usize
-    }
-
-    fn render_full_page(&self, index: usize, target_width: usize) -> Result<PageBitmap> {
-        with_pdfium(|pdfium| {
-            let document = pdfium
-                .load_pdf_from_file(&self.path, None)
-                .with_context(|| {
-                    format!("failed to load PDF with PDFium: {}", self.path.display())
-                })?;
-
-            let page = document.pages().get(self.check_index(index)?)?;
-            let render_config = PdfRenderConfig::new()
-                .set_target_width(target_width.clamp(200, 4096) as i32)
-                .set_maximum_height(4096)
-                .render_annotations(true)
-                .render_form_data(true);
-            let rendered = page.render_with_config(&render_config)?;
-
-            Ok(PageBitmap {
-                width: rendered.width() as usize,
-                height: rendered.height() as usize,
-                rgba: rendered.as_rgba_bytes(),
-            })
-        })
     }
 
     fn detect_layout_from_mode(mode: NotesMode) -> NotesDetectionResult {
@@ -371,12 +150,7 @@ impl DocumentBackend for PdfiumFallbackBackend {
         layout: Option<NotesLayout>,
         target_width: usize,
     ) -> Result<PageBitmap> {
-        let full_target_width = Self::effective_render_width(target_width, view, layout);
-        let full = self.render_full_page(index, full_target_width)?;
-        if let Some(layout) = layout {
-            return Ok(Self::crop_by_layout(&full, layout, view));
-        }
-        Ok(full)
+        render_page_bitmap_from_path(&self.path, index, view, layout, target_width)
     }
 
     fn page_geometry(&self, index: usize) -> Result<PageGeometry> {

@@ -95,6 +95,11 @@ impl<T: CacheWeight> PageCache<T> {
         Some(removed)
     }
 
+    pub fn clear(&mut self) {
+        self.cache.clear();
+        self.current_weight_bytes = 0;
+    }
+
     pub fn resize(&mut self, capacity: usize) {
         let safe_capacity = NonZeroUsize::new(capacity.max(1)).expect("non-zero cache capacity");
         self.cache.resize(safe_capacity);
@@ -160,5 +165,29 @@ mod tests {
         assert_eq!(cache.remove(1), Some("abc"));
         assert_eq!(cache.total_weight_bytes(), 2);
         assert!(!cache.contains(1));
+    }
+
+    #[test]
+    fn removing_missing_key_preserves_weight() {
+        let mut cache = PageCache::new(4, 1024);
+        cache.put(1, "abc");
+
+        assert_eq!(cache.remove(2), None);
+        assert_eq!(cache.total_weight_bytes(), 3);
+        assert!(cache.contains(1));
+    }
+
+    #[test]
+    fn clear_releases_all_entries_and_weight() {
+        let mut cache = PageCache::new(4, 1024);
+        cache.put(1, "abc");
+        cache.put(2, "de");
+
+        cache.clear();
+
+        assert!(cache.is_empty());
+        assert_eq!(cache.total_weight_bytes(), 0);
+        assert!(!cache.contains(1));
+        assert!(!cache.contains(2));
     }
 }

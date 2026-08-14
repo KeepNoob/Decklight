@@ -302,17 +302,17 @@ impl Default for AppConfig {
         Self {
             config_version: 4,
             theme: AppTheme::Dark,
-            cache_size: 200,
-            cache_budget_mb: 768,
-            projector_render_width: 1920,
-            presenter_render_width: 1280,
-            next_render_width: 896,
-            notes_render_width: 1024,
+            cache_size: 80,
+            cache_budget_mb: 256,
+            projector_render_width: 1280,
+            presenter_render_width: 960,
+            next_render_width: 640,
+            notes_render_width: 768,
             startup_content_fullscreen: true,
             notes_mode: NotesMode::Auto,
             notes_confidence_threshold: 0.35,
             notes_overrides: BTreeMap::new(),
-            overview_thumbnail_width: 320,
+            overview_thumbnail_width: 200,
             overview_columns: 4,
             auto_advance_default_interval_secs: 12,
             auto_advance_per_document: BTreeMap::new(),
@@ -401,6 +401,19 @@ mod tests {
         let loaded = AppConfig::load_from_path(&path).expect("load config");
 
         assert_eq!(loaded, config);
+    }
+
+    #[test]
+    fn defaults_use_lower_render_cache_settings() {
+        let config = AppConfig::default();
+
+        assert_eq!(config.cache_size, 80);
+        assert_eq!(config.cache_budget_mb, 256);
+        assert_eq!(config.projector_render_width, 1280);
+        assert_eq!(config.presenter_render_width, 960);
+        assert_eq!(config.next_render_width, 640);
+        assert_eq!(config.notes_render_width, 768);
+        assert_eq!(config.overview_thumbnail_width, 200);
     }
 
     #[test]
@@ -496,16 +509,16 @@ global_interval_secs = 99999
         let path = dir.path().join("config.toml");
         let raw = r#"
 config_version = 4
-cache_size = 200
-cache_budget_mb = 768
-projector_render_width = 1920
-presenter_render_width = 1280
-next_render_width = 896
-notes_render_width = 1024
+cache_size = 80
+cache_budget_mb = 256
+projector_render_width = 1280
+presenter_render_width = 960
+next_render_width = 640
+notes_render_width = 768
 startup_content_fullscreen = true
 notes_mode = "auto"
 notes_confidence_threshold = 0.35
-overview_thumbnail_width = 320
+overview_thumbnail_width = 200
 overview_columns = 4
 auto_advance_default_interval_secs = 12
 

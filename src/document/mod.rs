@@ -1,5 +1,6 @@
 mod lopdf_backend;
 mod pdfium_backend;
+mod pdfium_renderer;
 mod pdfium_runtime;
 
 use crate::cache::CacheWeight;
@@ -7,6 +8,7 @@ use crate::config::{NotesLayout, NotesMode};
 use anyhow::{Context, Result};
 pub use lopdf_backend::LopdfBackend;
 pub use pdfium_backend::PdfiumFallbackBackend;
+pub(crate) use pdfium_renderer::render_page_bitmap_from_path;
 use std::path::Path;
 
 #[derive(Debug, Clone)]

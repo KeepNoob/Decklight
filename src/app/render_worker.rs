@@ -1,14 +1,16 @@
 use crate::config::{NotesLayout, NotesMode};
-use crate::document::{DocumentBackend, PageBitmap, PageView, open_document};
+use crate::document::{PageBitmap, PageView, render_page_bitmap_from_path};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 
-const HIGH_PRIORITY_RENDER_QUEUE_CAPACITY: usize = 8;
-const NORMAL_PRIORITY_RENDER_QUEUE_CAPACITY: usize = 12;
-const LOW_PRIORITY_RENDER_QUEUE_CAPACITY: usize = 16;
-const RENDER_RESULT_QUEUE_CAPACITY: usize = 4;
+const HIGH_PRIORITY_RENDER_QUEUE_CAPACITY: usize = 4;
+const NORMAL_PRIORITY_RENDER_QUEUE_CAPACITY: usize = 4;
+const LOW_PRIORITY_RENDER_QUEUE_CAPACITY: usize = 4;
+const RENDER_RESULT_QUEUE_CAPACITY: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RenderPriority {
@@ -43,6 +45,9 @@ pub(super) enum RenderResult {
         namespace: usize,
         bitmap: PageBitmap,
     },
+    Cancelled {
+        key: RenderJobKey,
+    },
     Failed {
         key: RenderJobKey,
         message: String,
@@ -56,6 +61,7 @@ pub(super) struct RenderWorker {
     shutdown: Sender<()>,
     results: Receiver<RenderResult>,
     queued_keys: BTreeSet<RenderJobKey>,
+    latest_requested_generation: Arc<AtomicU64>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -69,6 +75,8 @@ impl RenderWorker {
             bounded(LOW_PRIORITY_RENDER_QUEUE_CAPACITY);
         let (shutdown_sender, shutdown_receiver) = bounded(1);
         let (result_sender, result_receiver) = bounded(RENDER_RESULT_QUEUE_CAPACITY);
+        let latest_requested_generation = Arc::new(AtomicU64::new(0));
+        let worker_latest_requested_generation = Arc::clone(&latest_requested_generation);
         let handle = match thread::Builder::new()
             .name("decklight-render-worker".to_owned())
             .spawn(move || {
@@ -78,6 +86,7 @@ impl RenderWorker {
                     low_priority_receiver,
                     shutdown_receiver,
                     result_sender,
+                    worker_latest_requested_generation,
                 )
             }) {
             Ok(handle) => Some(handle),
@@ -94,6 +103,7 @@ impl RenderWorker {
             shutdown: shutdown_sender,
             results: result_receiver,
             queued_keys: BTreeSet::new(),
+            latest_requested_generation,
             handle,
         }
     }
@@ -104,6 +114,7 @@ impl RenderWorker {
         }
 
         let key = job.key;
+        self.set_latest_generation(key.document_generation);
         let sender = match job.priority {
             RenderPriority::High => &self.high_priority_jobs,
             RenderPriority::Normal => &self.normal_priority_jobs,
@@ -120,12 +131,17 @@ impl RenderWorker {
     }
 
     pub(super) fn drain_results(&mut self) -> Vec<RenderResult> {
-        let mut results = Vec::new();
-        while let Ok(result) = self.results.try_recv() {
+        let mut results = Vec::with_capacity(1);
+        if let Ok(result) = self.results.try_recv() {
             self.queued_keys.remove(&result.key());
             results.push(result);
         }
         results
+    }
+
+    pub(super) fn set_latest_generation(&self, generation: u64) {
+        self.latest_requested_generation
+            .store(generation, Ordering::Release);
     }
 
     pub(super) fn has_pending_work(&self) -> bool {
@@ -148,6 +164,9 @@ impl Drop for RenderWorker {
         drop(old_high_priority_sender);
         drop(old_normal_priority_sender);
         drop(old_low_priority_sender);
+        let (_replacement_result_sender, replacement_result_receiver) = bounded(0);
+        let old_result_receiver = std::mem::replace(&mut self.results, replacement_result_receiver);
+        drop(old_result_receiver);
         if let Some(handle) = self.handle.take()
             && handle.join().is_err()
         {
@@ -159,9 +178,13 @@ impl Drop for RenderWorker {
 impl RenderResult {
     fn key(&self) -> RenderJobKey {
         match self {
-            Self::Ready { key, .. } | Self::Failed { key, .. } => *key,
+            Self::Ready { key, .. } | Self::Cancelled { key } | Self::Failed { key, .. } => *key,
         }
     }
+}
+
+fn generation_is_current(job_generation: u64, latest_generation: &AtomicU64) -> bool {
+    latest_generation.load(Ordering::Acquire) == job_generation
 }
 
 fn worker_loop(
@@ -170,9 +193,8 @@ fn worker_loop(
     low_priority_receiver: Receiver<RenderJob>,
     shutdown_receiver: Receiver<()>,
     result_sender: Sender<RenderResult>,
+    latest_generation: Arc<AtomicU64>,
 ) {
-    let mut document_cache = None;
-
     loop {
         if shutdown_receiver.try_recv().is_ok() {
             break;
@@ -183,8 +205,8 @@ fn worker_loop(
             .or_else(|_| normal_priority_receiver.try_recv())
             .or_else(|_| low_priority_receiver.try_recv());
         if let Ok(job) = message {
-            let result = render_job(&job, &mut document_cache);
-            if result_sender.send(result).is_err() {
+            let result = render_job(&job, latest_generation.as_ref());
+            if !send_render_result(&job, result, latest_generation.as_ref(), &result_sender) {
                 break;
             }
             continue;
@@ -193,17 +215,17 @@ fn worker_loop(
         select! {
             recv(shutdown_receiver) -> _message => break,
             recv(high_priority_receiver) -> message => {
-                if !handle_job_message(message, &mut document_cache, &result_sender) {
+                if !handle_job_message(message, latest_generation.as_ref(), &result_sender) {
                     break;
                 }
             },
             recv(normal_priority_receiver) -> message => {
-                if !handle_job_message(message, &mut document_cache, &result_sender) {
+                if !handle_job_message(message, latest_generation.as_ref(), &result_sender) {
                     break;
                 }
             },
             recv(low_priority_receiver) -> message => {
-                if !handle_job_message(message, &mut document_cache, &result_sender) {
+                if !handle_job_message(message, latest_generation.as_ref(), &result_sender) {
                     break;
                 }
             },
@@ -213,62 +235,39 @@ fn worker_loop(
 
 fn handle_job_message(
     message: Result<RenderJob, crossbeam_channel::RecvError>,
-    document_cache: &mut Option<WorkerDocumentCache>,
+    latest_generation: &AtomicU64,
     result_sender: &Sender<RenderResult>,
 ) -> bool {
     let Ok(job) = message else {
         return false;
     };
-    let result = render_job(&job, document_cache);
-    result_sender.send(result).is_ok()
+    let result = render_job(&job, latest_generation);
+    send_render_result(&job, result, latest_generation, result_sender)
 }
 
-struct WorkerDocumentCache {
-    source_path: PathBuf,
-    document_generation: u64,
-    backend: Box<dyn DocumentBackend>,
-}
-
-fn render_job(job: &RenderJob, document_cache: &mut Option<WorkerDocumentCache>) -> RenderResult {
-    let cache_matches = document_cache.as_ref().is_some_and(|cached| {
-        cached.source_path == job.source_path
-            && cached.document_generation == job.key.document_generation
-    });
-
-    if !cache_matches {
-        match open_document(&job.source_path) {
-            Ok(backend) => {
-                *document_cache = Some(WorkerDocumentCache {
-                    source_path: job.source_path.clone(),
-                    document_generation: job.key.document_generation,
-                    backend,
-                });
-            }
-            Err(error) => {
-                return RenderResult::Failed {
-                    key: job.key,
-                    message: format!("failed to open {}: {error}", job.source_path.display()),
-                };
-            }
-        }
+fn render_job(job: &RenderJob, latest_generation: &AtomicU64) -> RenderResult {
+    if !generation_is_current(job.key.document_generation, latest_generation) {
+        return RenderResult::Cancelled { key: job.key };
     }
 
-    let Some(cached) = document_cache.as_ref() else {
-        return RenderResult::Failed {
-            key: job.key,
-            message: "render worker document cache is unavailable".to_owned(),
-        };
-    };
-
-    match cached
-        .backend
-        .render_page_bitmap(job.index, job.view, job.layout, job.target_width)
-    {
-        Ok(bitmap) => RenderResult::Ready {
-            key: job.key,
-            namespace: job.namespace,
-            bitmap,
-        },
+    match render_page_bitmap_from_path(
+        &job.source_path,
+        job.index,
+        job.view,
+        job.layout,
+        job.target_width,
+    ) {
+        Ok(bitmap) if generation_is_current(job.key.document_generation, latest_generation) => {
+            RenderResult::Ready {
+                key: job.key,
+                namespace: job.namespace,
+                bitmap,
+            }
+        }
+        Ok(_bitmap) => RenderResult::Cancelled { key: job.key },
+        Err(_error) if !generation_is_current(job.key.document_generation, latest_generation) => {
+            RenderResult::Cancelled { key: job.key }
+        }
         Err(error) => RenderResult::Failed {
             key: job.key,
             message: format!(
@@ -278,5 +277,95 @@ fn render_job(job: &RenderJob, document_cache: &mut Option<WorkerDocumentCache>)
                 job.mode
             ),
         },
+    }
+}
+
+fn send_render_result(
+    job: &RenderJob,
+    mut result: RenderResult,
+    latest_generation: &AtomicU64,
+    result_sender: &Sender<RenderResult>,
+) -> bool {
+    if !generation_is_current(job.key.document_generation, latest_generation) {
+        result = RenderResult::Cancelled { key: job.key };
+    }
+    result_sender.send(result).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_queue_capacities_limit_bitmap_residency() {
+        assert_eq!(HIGH_PRIORITY_RENDER_QUEUE_CAPACITY, 4);
+        assert_eq!(NORMAL_PRIORITY_RENDER_QUEUE_CAPACITY, 4);
+        assert_eq!(LOW_PRIORITY_RENDER_QUEUE_CAPACITY, 4);
+        assert_eq!(RENDER_RESULT_QUEUE_CAPACITY, 1);
+    }
+
+    fn test_job(document_generation: u64) -> RenderJob {
+        RenderJob {
+            key: RenderJobKey {
+                cache_key: 1,
+                document_generation,
+            },
+            source_path: PathBuf::from("missing.pdf"),
+            index: 0,
+            mode: NotesMode::Auto,
+            view: PageView::Full,
+            layout: None,
+            target_width: 800,
+            namespace: 0,
+            priority: RenderPriority::Normal,
+        }
+    }
+
+    #[test]
+    fn obsolete_jobs_cancel_before_rendering() {
+        let latest_generation = AtomicU64::new(2);
+        let job = test_job(1);
+
+        assert!(matches!(
+            render_job(&job, &latest_generation),
+            RenderResult::Cancelled { key } if key == job.key
+        ));
+    }
+
+    #[test]
+    fn stale_ready_results_are_replaced_before_send() {
+        let latest_generation = AtomicU64::new(2);
+        let job = test_job(1);
+        let bitmap = PageBitmap {
+            width: 1,
+            height: 1,
+            rgba: vec![0; 4],
+        };
+        let result = RenderResult::Ready {
+            key: job.key,
+            namespace: job.namespace,
+            bitmap,
+        };
+        let (sender, receiver) = bounded(1);
+
+        assert!(send_render_result(
+            &job,
+            result,
+            &latest_generation,
+            &sender
+        ));
+        assert!(matches!(
+            receiver.try_recv().expect("cancelled result should be queued"),
+            RenderResult::Cancelled { key } if key == job.key
+        ));
+    }
+
+    #[test]
+    fn cancelled_results_preserve_queue_bookkeeping_key() {
+        let key = RenderJobKey {
+            cache_key: 7,
+            document_generation: 3,
+        };
+        assert_eq!(RenderResult::Cancelled { key }.key(), key);
     }
 }
