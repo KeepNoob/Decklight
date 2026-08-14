@@ -21,6 +21,10 @@ jobs:
             name: linux-x86_64
             format: appimage
             artifact_glob: dist/*.AppImage
+          - os: ubuntu-24.04-arm
+            name: linux-aarch64
+            format: appimage
+            artifact_glob: dist/*.AppImage
           - os: windows-latest
             name: windows-x86_64
             format: nsis
