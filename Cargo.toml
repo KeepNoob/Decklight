@@ -29,6 +29,7 @@ pdfium-render = {
     features = ["pdfium_7881", "image_latest", "thread_safe"],
 }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+rfd = "0.17.2"
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.11"
 tar = "0.4"

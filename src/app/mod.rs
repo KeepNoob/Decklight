@@ -143,7 +143,7 @@ impl PresenterApp {
             source_path_input: String::new(),
             go_to_input: String::new(),
             open_error: None,
-            status_message: Some("Ready. Enter a PDF path and click Load.".to_owned()),
+            status_message: Some("Ready. Choose a PDF to begin.".to_owned()),
             last_reload_check: now,
             non_critical_texture_refresh_after: None,
             render_worker: RenderWorker::start(),
@@ -1192,6 +1192,22 @@ impl PresenterApp {
         if let Err(error) = self.load_document(path) {
             self.open_error = Some(error.to_string());
         }
+    }
+
+    fn open_pdf_dialog(&self) -> Option<PathBuf> {
+        let mut dialog = rfd::FileDialog::new().add_filter("PDF files", &["pdf"]);
+        let source_path = Path::new(self.source_path_input.trim());
+        if let Some(parent) = source_path.parent() {
+            let directory = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            if directory.is_dir() {
+                dialog = dialog.set_directory(directory);
+            }
+        }
+        dialog.pick_file()
     }
 
     fn execute_pending_unsaved_action(&mut self, ctx: &Context, action: PendingUnsavedAction) {
@@ -5252,28 +5268,33 @@ impl PresenterApp {
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("PDF").color(palette.text_secondary));
-                    let path_width = (ui.available_width() * 0.34).clamp(240.0, 520.0);
-                    let path_response = ui.add_sized(
-                        Vec2::new(path_width, 30.0),
-                        egui::TextEdit::singleline(&mut self.source_path_input)
-                            .hint_text("Drop in a PDF path"),
-                    );
-                    let load_clicked = ui
+                    let current_path = self.source_path_input.trim().to_owned();
+                    let current_filename = Path::new(&current_path)
+                        .file_name()
+                        .map(|filename| filename.to_string_lossy().into_owned())
+                        .filter(|filename| !filename.is_empty());
+                    let open_clicked = ui
                         .add(
-                            egui::Button::new(RichText::new("Load").strong())
+                            egui::Button::new(RichText::new("Open PDF…").strong())
                                 .fill(palette.accent_soft)
                                 .stroke(Stroke::new(1.0, palette.accent)),
                         )
                         .clicked();
-                    let enter_pressed = path_response.lost_focus()
-                        && ui.input(|input| input.key_pressed(Key::Enter));
-                    if load_clicked || enter_pressed {
-                        let source = PathBuf::from(self.source_path_input.trim());
-                        if source.exists() {
-                            self.request_load_document(source);
-                        } else {
-                            self.open_error = Some("Path does not exist.".to_owned());
-                        }
+                    if open_clicked && let Some(path) = self.open_pdf_dialog() {
+                        self.source_path_input = path.display().to_string();
+                        self.request_load_document(path);
+                    }
+                    let filename_width = (ui.available_width() * 0.24).clamp(120.0, 260.0);
+                    let filename_response = ui.add_sized(
+                        Vec2::new(filename_width, 30.0),
+                        egui::Label::new(
+                            RichText::new(current_filename.as_deref().unwrap_or("No PDF selected"))
+                                .color(palette.text_secondary),
+                        )
+                        .truncate(),
+                    );
+                    if !current_path.is_empty() {
+                        filename_response.on_hover_text(current_path);
                     }
 
                     ui.separator();
