@@ -149,6 +149,7 @@ impl PresenterApp {
             render_worker: RenderWorker::start(),
             render_document_generation: 0,
             projector_viewport: ViewportId::from_hash_of("projector_window"),
+            single_monitor_zoom_share: false,
             projector_texture: None,
             projector_texture_key: None,
             projector_low_res_texture_key: None,
@@ -789,8 +790,15 @@ impl PresenterApp {
         if !typing_in_text_field
             && self.shortcut_consume(ctx, ShortcutAction::ToggleProjectorFullscreen)
         {
-            self.apply_command(AppCommand::ToggleProjectorFullscreen);
-            self.persist_config();
+            if self.single_monitor_zoom_share {
+                self.status_message = Some(
+                    "Fullscreen is disabled in Zoom Share mode. Exit Zoom Share to change it."
+                        .to_owned(),
+                );
+            } else {
+                self.apply_command(AppCommand::ToggleProjectorFullscreen);
+                self.persist_config();
+            }
         }
         if !typing_in_text_field && self.shortcut_consume(ctx, ShortcutAction::ResetTimer) {
             self.apply_command(AppCommand::ResetTimer);
@@ -4608,10 +4616,24 @@ impl PresenterApp {
             "PDF Presenter - Projector"
         };
 
-        let viewport = ViewportBuilder::default()
+        let mut viewport = ViewportBuilder::default()
             .with_title(title)
-            .with_inner_size([1280.0, 720.0])
-            .with_fullscreen(self.state.projector_fullscreen);
+            .with_inner_size([1280.0, 720.0]);
+        if self.single_monitor_zoom_share {
+            viewport = viewport
+                .with_fullscreen(false)
+                .with_maximized(true)
+                .with_decorations(false)
+                .with_window_level(egui::WindowLevel::AlwaysOnBottom)
+                .with_mouse_passthrough(true);
+        } else {
+            viewport = viewport
+                .with_fullscreen(self.state.projector_fullscreen)
+                .with_maximized(false)
+                .with_decorations(true)
+                .with_window_level(egui::WindowLevel::Normal)
+                .with_mouse_passthrough(false);
+        }
 
         let texture = if self.state.screen_roles_swapped {
             self.presenter_texture.clone()
@@ -4859,7 +4881,35 @@ impl PresenterApp {
                     if ui.button("Swap (S)").clicked() {
                         self.apply_command(AppCommand::SwapScreens);
                     }
-                    if ui.button("Fullscreen (F)").clicked() {
+                    let mode_response = ui.button(if self.single_monitor_zoom_share {
+                        "Mode: Zoom Share"
+                    } else {
+                        "Mode: Second Display"
+                    });
+                    let mode_clicked = mode_response.clicked();
+                    mode_response.on_hover_text(
+                        "Zoom Share keeps the projector on the same macOS Desktop behind Presenter for window sharing.",
+                    );
+                    if mode_clicked {
+                        self.single_monitor_zoom_share = !self.single_monitor_zoom_share;
+                        self.status_message = Some(if self.single_monitor_zoom_share {
+                            "Zoom Share enabled.".to_owned()
+                        } else {
+                            "Second Display mode enabled.".to_owned()
+                        });
+                        ctx.request_repaint_of(self.projector_viewport);
+                    }
+                    let fullscreen_response = ui.add_enabled(
+                        !self.single_monitor_zoom_share,
+                        egui::Button::new("Fullscreen (F)"),
+                    );
+                    let fullscreen_clicked = fullscreen_response.clicked();
+                    if self.single_monitor_zoom_share {
+                        fullscreen_response.on_hover_text(
+                            "Fullscreen is disabled in Zoom Share mode. Exit Zoom Share to change it.",
+                        );
+                    }
+                    if fullscreen_clicked {
                         self.apply_command(AppCommand::ToggleProjectorFullscreen);
                         self.persist_config();
                     }

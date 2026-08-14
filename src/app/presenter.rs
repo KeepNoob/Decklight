@@ -37,6 +37,7 @@ pub(super) struct PresenterApp {
     pub(super) render_worker: RenderWorker,
     pub(super) render_document_generation: u64,
     pub(super) projector_viewport: ViewportId,
+    pub(super) single_monitor_zoom_share: bool,
     pub(super) texture_cache: PageCache<CachedTexture>,
     pub(super) projector_texture: Option<TextureHandle>,
     pub(super) projector_texture_key: Option<usize>,
