@@ -1,3 +1,4 @@
+use super::pdfium_runtime::with_pdfium;
 use crate::config::{NotesLayout, NotesMode, NotesSide, SplitAxis};
 use crate::document::{
     AnnotationMetadata, AnnotationPriority, AnnotationStatus, DocumentBackend, NewInkAnnotation,
@@ -7,7 +8,6 @@ use crate::document::{
 use anyhow::{Context, Result, bail};
 use chrono::Local;
 use lopdf::{Dictionary, Document, Object, ObjectId, StringFormat};
-use pdfium_auto::bind_pdfium_silent;
 use pdfium_render::prelude::PdfRenderConfig;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -1222,33 +1222,33 @@ impl LopdfBackend {
     }
 
     fn render_full_page(&self, index: usize, target_width: usize) -> Result<PageBitmap> {
-        let pdfium = bind_pdfium_silent().map_err(|error| {
-            anyhow::anyhow!("failed to bind PDFium runtime (first run may need network): {error}")
-        })?;
+        with_pdfium(|pdfium| {
+            let document = pdfium
+                .load_pdf_from_file(&self.path, None)
+                .with_context(|| {
+                    format!("failed to load PDF with PDFium: {}", self.path.display())
+                })?;
+            let page_index: i32 = index
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("page index out of range for PDFium: {}", index))?;
+            let page = document.pages().get(page_index)?;
 
-        let document = pdfium
-            .load_pdf_from_file(&self.path, None)
-            .with_context(|| format!("failed to load PDF with PDFium: {}", self.path.display()))?;
-        let page_index: u16 = index
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("page index out of range for PDFium: {}", index))?;
-        let page = document.pages().get(page_index)?;
+            let render_config = PdfRenderConfig::new()
+                .set_target_width(target_width.clamp(200, 4096) as i32)
+                // Use a high max-height cap so split-region supersampling does not get downscaled.
+                .set_maximum_height(4096)
+                .render_annotations(true)
+                .render_form_data(true);
 
-        let render_config = PdfRenderConfig::new()
-            .set_target_width(target_width.clamp(200, 4096) as i32)
-            // Use a high max-height cap so split-region supersampling does not get downscaled.
-            .set_maximum_height(4096)
-            .render_annotations(true)
-            .render_form_data(true);
+            let rendered = page.render_with_config(&render_config)?;
+            let width = rendered.width() as usize;
+            let height = rendered.height() as usize;
 
-        let rendered = page.render_with_config(&render_config)?;
-        let width = rendered.width() as usize;
-        let height = rendered.height() as usize;
-
-        Ok(PageBitmap {
-            width,
-            height,
-            rgba: rendered.as_rgba_bytes(),
+            Ok(PageBitmap {
+                width,
+                height,
+                rgba: rendered.as_rgba_bytes(),
+            })
         })
     }
 }

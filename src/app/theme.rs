@@ -120,7 +120,7 @@ pub(super) fn theme_label(theme: AppTheme) -> &'static str {
 
 pub(super) fn install_visual_style(ctx: &Context, theme: AppTheme) {
     let palette = ThemePalette::for_theme(theme);
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
     let mut visuals = match theme {
         AppTheme::Light => Visuals::light(),
         AppTheme::Dark | AppTheme::ProjectorSafe => Visuals::dark(),
@@ -180,7 +180,7 @@ pub(super) fn install_visual_style(ctx: &Context, theme: AppTheme) {
         FontId::new(13.0, FontFamily::Monospace),
     );
 
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }
 
 pub(super) fn card_frame(theme: AppTheme) -> egui::Frame {

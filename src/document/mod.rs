@@ -1,5 +1,6 @@
 mod lopdf_backend;
 mod pdfium_backend;
+mod pdfium_runtime;
 
 use crate::cache::CacheWeight;
 use crate::config::{NotesLayout, NotesMode};

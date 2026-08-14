@@ -676,7 +676,7 @@ impl PresenterApp {
     fn clear_overview_textures(&mut self) {}
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let typing_in_text_field = ctx.wants_keyboard_input();
+        let typing_in_text_field = ctx.egui_wants_keyboard_input();
 
         if !typing_in_text_field && self.shortcut_consume(ctx, ShortcutAction::ToggleDeckOverview) {
             let was_open = self.deck_overview.is_open;
@@ -4515,11 +4515,7 @@ impl PresenterApp {
 
         if response.hovered() {
             let (scroll_delta, pinch_zoom_delta, zoom_modifier_down) = ctx.input(|input| {
-                let scroll = if input.smooth_scroll_delta.length_sq() > 0.01 {
-                    input.smooth_scroll_delta
-                } else {
-                    input.raw_scroll_delta
-                };
+                let scroll = input.smooth_scroll_delta;
                 let zoom_modifier = input.modifiers.ctrl || input.modifiers.command;
                 (scroll, input.zoom_delta(), zoom_modifier)
             });
@@ -4654,16 +4650,17 @@ impl PresenterApp {
         let laser_position = self.laser_position;
         let palette = self.palette();
 
-        ctx.show_viewport_immediate(self.projector_viewport, viewport, |ctx, _class| {
+        ctx.show_viewport_immediate(self.projector_viewport, viewport, |ui, _class| {
+            let viewport_ctx = ui.ctx().clone();
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(palette.slide_surface))
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     if let Some(texture) = texture.as_ref() {
                         let viewport_size = ui.available_size();
                         let (response, image_rect, reset_requested) =
                             PresenterApp::render_zoomable_texture_surface(
                                 ui,
-                                ctx,
+                                &viewport_ctx,
                                 texture,
                                 viewport_size,
                                 &mut projector_zoom_pan,
@@ -4673,7 +4670,9 @@ impl PresenterApp {
                             projector_reset_requested = true;
                         }
                         projector_laser_sample = Some(PresenterApp::capture_laser_sample(
-                            ctx, &response, image_rect,
+                            &viewport_ctx,
+                            &response,
+                            image_rect,
                         ));
                         PresenterApp::draw_highlight_overlay_from_snapshot(
                             ui,
@@ -4765,7 +4764,7 @@ impl PresenterApp {
         }
     }
 
-    fn render_presenter_view(&mut self, ctx: &egui::Context) {
+    fn render_presenter_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let talk_elapsed = Self::format_duration(self.state.talk_elapsed(Instant::now()));
         let slide_elapsed = Self::format_duration(self.state.current_slide_elapsed(Instant::now()));
         let wall_clock = Local::now().format("%H:%M:%S").to_string();
@@ -4788,14 +4787,14 @@ impl PresenterApp {
         }
         let palette = self.palette();
 
-        egui::TopBottomPanel::top("top_controls")
+        egui::Panel::top("top_controls")
             .frame(
                 egui::Frame::new()
                     .fill(palette.top_bar)
                     .stroke(Stroke::new(1.0, palette.panel_stroke))
                     .inner_margin(egui::Margin::symmetric(14, 10)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new("Decklight")
@@ -4906,7 +4905,7 @@ impl PresenterApp {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(palette.app_background))
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
             let available = ui.available_size();
             let left_width = available.x * 0.60;
             let right_width = (available.x - left_width - 8.0).max(280.0);
@@ -5818,7 +5817,8 @@ impl PresenterApp {
 }
 
 impl eframe::App for PresenterApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         self.laser_persistent_seen_this_frame = false;
         self.laser_primary_down_seen_this_frame = false;
         let close_requested = ctx.input(|input| input.viewport().close_requested());
@@ -5832,12 +5832,12 @@ impl eframe::App for PresenterApp {
                 }
             }
         }
-        self.handle_shortcuts(ctx);
+        self.handle_shortcuts(&ctx);
         self.apply_overview_commit();
         self.refresh_document_if_changed();
         self.run_auto_advance_tick();
-        self.apply_background_render_results(ctx);
-        self.refresh_textures(ctx);
+        self.apply_background_render_results(&ctx);
+        self.refresh_textures(&ctx);
 
         let root_title = if self.state.screen_roles_swapped {
             "PDF Presenter - Projector (Swapped)"
@@ -5846,16 +5846,17 @@ impl eframe::App for PresenterApp {
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(root_title.to_owned()));
 
-        self.render_presenter_view(ctx);
-        self.render_projector_view(ctx);
-        self.render_unsaved_changes_dialog(ctx);
-        self.render_unsaved_toast(ctx);
-        self.finish_laser_frame(ctx);
+        self.render_presenter_view(ui, &ctx);
+        self.render_projector_view(&ctx);
+        self.render_unsaved_changes_dialog(&ctx);
+        self.render_unsaved_toast(&ctx);
+        self.finish_laser_frame(&ctx);
         let repaint_delay = if self.render_worker.has_pending_work() {
             Duration::from_millis(16)
         } else {
             Duration::from_millis(100)
         };
+        ctx.request_repaint_of(self.projector_viewport);
         ctx.request_repaint_after(repaint_delay);
     }
 }

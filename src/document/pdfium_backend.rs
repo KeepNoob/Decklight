@@ -1,10 +1,10 @@
+use super::pdfium_runtime::with_pdfium;
 use crate::config::{NotesLayout, NotesMode, NotesSide, SplitAxis};
 use crate::document::{
     DocumentBackend, NewInkAnnotation, NewTextAnnotation, NotesDetectionResult, PageBitmap,
     PageGeometry, PageView, TextAnnotation,
 };
 use anyhow::{Context, Result, bail};
-use pdfium_auto::bind_pdfium_silent;
 use pdfium_render::prelude::PdfRenderConfig;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -24,16 +24,16 @@ impl PdfiumFallbackBackend {
             bail!("document not found: {}", path.display());
         }
 
-        let pdfium = bind_pdfium_silent().map_err(|error| {
-            anyhow::anyhow!("failed to bind PDFium runtime (first run may need network): {error}")
+        let page_count = with_pdfium(|pdfium| {
+            let document = pdfium
+                .load_pdf_from_file(path, None)
+                .with_context(|| format!("failed to load PDF with PDFium: {}", path.display()))?;
+            let page_count = document.pages().len() as usize;
+            if page_count == 0 {
+                bail!("document has no pages: {}", path.display());
+            }
+            Ok(page_count)
         })?;
-        let document = pdfium
-            .load_pdf_from_file(path, None)
-            .with_context(|| format!("failed to load PDF with PDFium: {}", path.display()))?;
-        let page_count = document.pages().len() as usize;
-        if page_count == 0 {
-            bail!("document has no pages: {}", path.display());
-        }
 
         let metadata = std::fs::metadata(path)
             .with_context(|| format!("failed to read metadata for {}", path.display()))?;
@@ -45,7 +45,7 @@ impl PdfiumFallbackBackend {
         })
     }
 
-    fn check_index(&self, index: usize) -> Result<u16> {
+    fn check_index(&self, index: usize) -> Result<i32> {
         if index >= self.page_count {
             bail!("page index out of bounds: {index}");
         }
@@ -252,25 +252,26 @@ impl PdfiumFallbackBackend {
     }
 
     fn render_full_page(&self, index: usize, target_width: usize) -> Result<PageBitmap> {
-        let pdfium = bind_pdfium_silent().map_err(|error| {
-            anyhow::anyhow!("failed to bind PDFium runtime (first run may need network): {error}")
-        })?;
-        let document = pdfium
-            .load_pdf_from_file(&self.path, None)
-            .with_context(|| format!("failed to load PDF with PDFium: {}", self.path.display()))?;
+        with_pdfium(|pdfium| {
+            let document = pdfium
+                .load_pdf_from_file(&self.path, None)
+                .with_context(|| {
+                    format!("failed to load PDF with PDFium: {}", self.path.display())
+                })?;
 
-        let page = document.pages().get(self.check_index(index)?)?;
-        let render_config = PdfRenderConfig::new()
-            .set_target_width(target_width.clamp(200, 4096) as i32)
-            .set_maximum_height(4096)
-            .render_annotations(true)
-            .render_form_data(true);
-        let rendered = page.render_with_config(&render_config)?;
+            let page = document.pages().get(self.check_index(index)?)?;
+            let render_config = PdfRenderConfig::new()
+                .set_target_width(target_width.clamp(200, 4096) as i32)
+                .set_maximum_height(4096)
+                .render_annotations(true)
+                .render_form_data(true);
+            let rendered = page.render_with_config(&render_config)?;
 
-        Ok(PageBitmap {
-            width: rendered.width() as usize,
-            height: rendered.height() as usize,
-            rgba: rendered.as_rgba_bytes(),
+            Ok(PageBitmap {
+                width: rendered.width() as usize,
+                height: rendered.height() as usize,
+                rgba: rendered.as_rgba_bytes(),
+            })
         })
     }
 
@@ -379,17 +380,18 @@ impl DocumentBackend for PdfiumFallbackBackend {
     }
 
     fn page_geometry(&self, index: usize) -> Result<PageGeometry> {
-        let pdfium = bind_pdfium_silent().map_err(|error| {
-            anyhow::anyhow!("failed to bind PDFium runtime (first run may need network): {error}")
-        })?;
-        let document = pdfium
-            .load_pdf_from_file(&self.path, None)
-            .with_context(|| format!("failed to load PDF with PDFium: {}", self.path.display()))?;
-        let page = document.pages().get(self.check_index(index)?)?;
+        with_pdfium(|pdfium| {
+            let document = pdfium
+                .load_pdf_from_file(&self.path, None)
+                .with_context(|| {
+                    format!("failed to load PDF with PDFium: {}", self.path.display())
+                })?;
+            let page = document.pages().get(self.check_index(index)?)?;
 
-        Ok(PageGeometry {
-            width: page.width().value.abs().max(1.0),
-            height: page.height().value.abs().max(1.0),
+            Ok(PageGeometry {
+                width: page.width().value.abs().max(1.0),
+                height: page.height().value.abs().max(1.0),
+            })
         })
     }
 
