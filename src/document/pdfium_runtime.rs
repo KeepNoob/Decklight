@@ -10,11 +10,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime};
 
-const PDFIUM_VERSION: &str = "7961";
-const PDFIUM_RELEASE: &str = "152.0.7961.0";
-const PDFIUM_SOURCE: &str = "bblanchon/pdfium-binaries chromium/7961";
+const PDFIUM_VERSION: &str = "8100";
+const PDFIUM_RELEASE: &str = "157.0.8100.0";
+const PDFIUM_SOURCE: &str = "bblanchon/pdfium-binaries chromium/8100";
 const PDFIUM_RELEASE_BASE_URL: &str =
-    "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7961/";
+    "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/8100/";
 const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_LIBRARY_BYTES: u64 = 128 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -37,10 +37,10 @@ const LINUX_AARCH64: PlatformInfo = PlatformInfo {
     archive_name: "pdfium-linux-arm64.tgz",
     library_member: "lib/libpdfium.so",
     library_name: "libpdfium.so",
-    archive_size: 3_597_708,
-    archive_sha256: "974107999784a438149605024475d42d80dd306799d90e1af5f6fa63f976455f",
-    library_size: 7_822_096,
-    library_sha256: "38832b476d8a6d2f9862bc8b3ab5a7171cfb5c6d830ef5f73b2918ab96515382",
+    archive_size: 3_714_894,
+    archive_sha256: "58c87a95a40a24c914a9c755fae798843f46f06adf9e5e9f2c893302d4bdb040",
+    library_size: 8_091_184,
+    library_sha256: "51faba3b1b580d8da572b560442f51e1e629180bae70ed37294a19f220623026",
 };
 
 const LINUX_X86_64: PlatformInfo = PlatformInfo {
@@ -48,10 +48,10 @@ const LINUX_X86_64: PlatformInfo = PlatformInfo {
     archive_name: "pdfium-linux-x64.tgz",
     library_member: "lib/libpdfium.so",
     library_name: "libpdfium.so",
-    archive_size: 3_650_783,
-    archive_sha256: "019665c8877d46fe65f625f80fd714ab07aac68554b0636acf2a2adf9288adb2",
-    library_size: 7_621_800,
-    library_sha256: "3019ad1cd6980e51d900bb9266f8980cb846cb8e0c1f6553c52a7a1626469020",
+    archive_size: 3_799_482,
+    archive_sha256: "1c1894a12d4d96ee01400c3874444126254180c5c7d2ab628576b67f8120320a",
+    library_size: 7_964_952,
+    library_sha256: "b8784cbd652ad2993332b7695e2c80f3a797f877fc47d9be97b66bca9639539e",
 };
 
 const MACOS_AARCH64: PlatformInfo = PlatformInfo {
@@ -59,10 +59,10 @@ const MACOS_AARCH64: PlatformInfo = PlatformInfo {
     archive_name: "pdfium-mac-arm64.tgz",
     library_member: "lib/libpdfium.dylib",
     library_name: "libpdfium.dylib",
-    archive_size: 3_429_737,
-    archive_sha256: "1193a771e0bd934530afa3df73a0d44551d8f4078442e290054e6dd38ded960f",
-    library_size: 7_151_568,
-    library_sha256: "c2f68f87106da4f0cb6d6a90a7aad9644b3c1cb92a3463dbdc8f39449aec3869",
+    archive_size: 3_529_672,
+    archive_sha256: "7ea647c7a7a9c1169be3f947000bc071ece2fade2cd6bd7e401e3675c6560cce",
+    library_size: 7_360_768,
+    library_sha256: "38d2326d9bfa8ed935bcd757348244d96e1ea4b0e274d3ee789c5b922726e350",
 };
 
 const MACOS_X86_64: PlatformInfo = PlatformInfo {
@@ -70,10 +70,10 @@ const MACOS_X86_64: PlatformInfo = PlatformInfo {
     archive_name: "pdfium-mac-x64.tgz",
     library_member: "lib/libpdfium.dylib",
     library_name: "libpdfium.dylib",
-    archive_size: 3_590_254,
-    archive_sha256: "17f069d7012ab83898ad5eddebd139b240f05d7411c220775d507a0e3e285536",
-    library_size: 7_442_536,
-    library_sha256: "6656bfa9ad5f5fd7b66a104034c9ac6d390b369d540e6102f6d6bede687d09cf",
+    archive_size: 3_725_041,
+    archive_sha256: "d513a0530a0f0c1ca9929ded06660e27edb9a108a7d18d9df55a5fb060b091c8",
+    library_size: 7_733_224,
+    library_sha256: "89d52641d360e6963d41764a3e12f973903ba536cf23fbfd4333a6a2ef03cd48",
 };
 
 const WINDOWS_AARCH64: PlatformInfo = PlatformInfo {
@@ -81,10 +81,10 @@ const WINDOWS_AARCH64: PlatformInfo = PlatformInfo {
     archive_name: "pdfium-win-arm64.tgz",
     library_member: "bin/pdfium.dll",
     library_name: "pdfium.dll",
-    archive_size: 3_532_860,
-    archive_sha256: "9d8c50c65f129c3774b972cde09d3bea44478075f72faadfe9fc0c152e65d509",
-    library_size: 6_669_312,
-    library_sha256: "9c084388e1dbd1a41c4e876af02c929ae9b63fd9ff7eb1b6dc5750230a5a4dd9",
+    archive_size: 3_643_348,
+    archive_sha256: "cca9b28d406ae2a902b0b710a92ab699c4c2931564ab6efe44630014d492a9ca",
+    library_size: 6_878_720,
+    library_sha256: "9b73b701916dbbca1a7c2ea79b228a9536bbff90bf9ee67e93b3c13b591f0daa",
 };
 
 const WINDOWS_X86_64: PlatformInfo = PlatformInfo {
@@ -92,10 +92,10 @@ const WINDOWS_X86_64: PlatformInfo = PlatformInfo {
     archive_name: "pdfium-win-x64.tgz",
     library_member: "bin/pdfium.dll",
     library_name: "pdfium.dll",
-    archive_size: 3_741_865,
-    archive_sha256: "88276459349b291c41f10422dad0210f007c04d919c8fa56472b6b7c6406adf4",
-    library_size: 7_220_736,
-    library_sha256: "d3d9f4b7c9dabe3363f30779c5c3c715c47332749fa590e4b4a2b8b6780cb1c4",
+    archive_size: 3_875_218,
+    archive_sha256: "51621bcc1d9be9ea448f4b84b0516862b928e3968d3fca899af1a6d6e2848d6d",
+    library_size: 7_512_064,
+    library_sha256: "ae913f407e8d3f5cdbf08a9869564d647b13e132e01eb376c0a5a33b7a227a45",
 };
 
 static RESOLUTION_MUTEX: Mutex<()> = Mutex::new(());
@@ -728,10 +728,10 @@ mod tests {
                 "pdfium-linux-arm64.tgz",
                 "lib/libpdfium.so",
                 "libpdfium.so",
-                3_597_708,
-                "974107999784a438149605024475d42d80dd306799d90e1af5f6fa63f976455f",
-                7_822_096,
-                "38832b476d8a6d2f9862bc8b3ab5a7171cfb5c6d830ef5f73b2918ab96515382",
+                3_714_894,
+                "58c87a95a40a24c914a9c755fae798843f46f06adf9e5e9f2c893302d4bdb040",
+                8_091_184,
+                "51faba3b1b580d8da572b560442f51e1e629180bae70ed37294a19f220623026",
             ),
             (
                 "linux",
@@ -740,10 +740,10 @@ mod tests {
                 "pdfium-linux-x64.tgz",
                 "lib/libpdfium.so",
                 "libpdfium.so",
-                3_650_783,
-                "019665c8877d46fe65f625f80fd714ab07aac68554b0636acf2a2adf9288adb2",
-                7_621_800,
-                "3019ad1cd6980e51d900bb9266f8980cb846cb8e0c1f6553c52a7a1626469020",
+                3_799_482,
+                "1c1894a12d4d96ee01400c3874444126254180c5c7d2ab628576b67f8120320a",
+                7_964_952,
+                "b8784cbd652ad2993332b7695e2c80f3a797f877fc47d9be97b66bca9639539e",
             ),
             (
                 "macos",
@@ -752,10 +752,10 @@ mod tests {
                 "pdfium-mac-arm64.tgz",
                 "lib/libpdfium.dylib",
                 "libpdfium.dylib",
-                3_429_737,
-                "1193a771e0bd934530afa3df73a0d44551d8f4078442e290054e6dd38ded960f",
-                7_151_568,
-                "c2f68f87106da4f0cb6d6a90a7aad9644b3c1cb92a3463dbdc8f39449aec3869",
+                3_529_672,
+                "7ea647c7a7a9c1169be3f947000bc071ece2fade2cd6bd7e401e3675c6560cce",
+                7_360_768,
+                "38d2326d9bfa8ed935bcd757348244d96e1ea4b0e274d3ee789c5b922726e350",
             ),
             (
                 "macos",
@@ -764,10 +764,10 @@ mod tests {
                 "pdfium-mac-x64.tgz",
                 "lib/libpdfium.dylib",
                 "libpdfium.dylib",
-                3_590_254,
-                "17f069d7012ab83898ad5eddebd139b240f05d7411c220775d507a0e3e285536",
-                7_442_536,
-                "6656bfa9ad5f5fd7b66a104034c9ac6d390b369d540e6102f6d6bede687d09cf",
+                3_725_041,
+                "d513a0530a0f0c1ca9929ded06660e27edb9a108a7d18d9df55a5fb060b091c8",
+                7_733_224,
+                "89d52641d360e6963d41764a3e12f973903ba536cf23fbfd4333a6a2ef03cd48",
             ),
             (
                 "windows",
@@ -776,10 +776,10 @@ mod tests {
                 "pdfium-win-arm64.tgz",
                 "bin/pdfium.dll",
                 "pdfium.dll",
-                3_532_860,
-                "9d8c50c65f129c3774b972cde09d3bea44478075f72faadfe9fc0c152e65d509",
-                6_669_312,
-                "9c084388e1dbd1a41c4e876af02c929ae9b63fd9ff7eb1b6dc5750230a5a4dd9",
+                3_643_348,
+                "cca9b28d406ae2a902b0b710a92ab699c4c2931564ab6efe44630014d492a9ca",
+                6_878_720,
+                "9b73b701916dbbca1a7c2ea79b228a9536bbff90bf9ee67e93b3c13b591f0daa",
             ),
             (
                 "windows",
@@ -788,10 +788,10 @@ mod tests {
                 "pdfium-win-x64.tgz",
                 "bin/pdfium.dll",
                 "pdfium.dll",
-                3_741_865,
-                "88276459349b291c41f10422dad0210f007c04d919c8fa56472b6b7c6406adf4",
-                7_220_736,
-                "d3d9f4b7c9dabe3363f30779c5c3c715c47332749fa590e4b4a2b8b6780cb1c4",
+                3_875_218,
+                "51621bcc1d9be9ea448f4b84b0516862b928e3968d3fca899af1a6d6e2848d6d",
+                7_512_064,
+                "ae913f407e8d3f5cdbf08a9869564d647b13e132e01eb376c0a5a33b7a227a45",
             ),
         ];
 

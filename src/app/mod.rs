@@ -1337,7 +1337,7 @@ impl PresenterApp {
             return;
         };
         let palette = self.palette();
-        egui::Area::new("unsaved_edit_toast".into())
+        egui::Area::new(egui::Id::unique("unsaved_edit_toast"))
             .anchor(Align2::RIGHT_BOTTOM, Vec2::new(-16.0, -16.0))
             .show(ctx, |ui| {
                 let frame = egui::Frame::new()
@@ -3278,7 +3278,7 @@ impl PresenterApp {
         let note_actions_enabled = mode == InteractionMode::AnnotationEdit && selected_exists;
         let can_save = self.has_unsaved_annotation_changes();
 
-        let overlay_id = egui::Id::new("quick_actions_overlay");
+        let overlay_id = egui::Id::unique("quick_actions_overlay");
         let overlay_width = (image_rect.width() - 20.0).clamp(220.0, 560.0);
         let overlay_offset = Vec2::new(16.0, -16.0);
         egui::Area::new(overlay_id)
