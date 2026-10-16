@@ -1,3 +1,4 @@
+use super::document_loader::DocumentLoad;
 use super::interaction::{
     ActiveTextTransform, HighlightTool, PenStrokeStyle, PendingUnsavedAction, SessionInkStroke,
     ZoomPanState,
@@ -11,7 +12,7 @@ use super::timing::TimingBreakdownState;
 use crate::cache::PageCache;
 use crate::config::{AppConfig, NotesLayout, NotesLayoutOverrideConfig};
 use crate::document::{DocumentBackend, TextAnnotation};
-use eframe::egui::{TextureHandle, ViewportId};
+use eframe::egui::{Context, TextureHandle, ViewportId};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -36,6 +37,12 @@ pub(super) struct PresenterApp {
     pub(super) non_critical_texture_refresh_after: Option<Instant>,
     pub(super) render_worker: RenderWorker,
     pub(super) render_document_generation: u64,
+    pub(super) render_request_generation: u64,
+    pub(super) failed_render_keys: BTreeSet<usize>,
+    pub(super) egui_context: Context,
+    pub(super) document_load: Option<DocumentLoad>,
+    pub(super) outline_paths_by_page: Vec<Option<Vec<String>>>,
+    pub(super) last_root_title: Option<&'static str>,
     pub(super) projector_viewport: ViewportId,
     pub(super) single_monitor_zoom_share: bool,
     pub(super) texture_cache: PageCache<CachedTexture>,

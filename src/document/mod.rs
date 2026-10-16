@@ -7,6 +7,7 @@ use crate::cache::CacheWeight;
 use crate::config::{NotesLayout, NotesMode};
 use anyhow::{Context, Result};
 pub use lopdf_backend::LopdfBackend;
+pub(crate) use lopdf_backend::detect_notes_layout_from_path;
 pub use pdfium_backend::PdfiumFallbackBackend;
 pub(crate) use pdfium_renderer::render_page_bitmap_from_path;
 use std::path::Path;
@@ -171,13 +172,22 @@ pub struct NewInkAnnotation {
     pub width: f32,
 }
 
-pub trait DocumentBackend {
+/// Implementations are `Send` so documents can be opened on a background thread.
+pub trait DocumentBackend: Send {
     fn source_path(&self) -> &Path;
     fn page_count(&self) -> usize;
     fn page_label(&self, index: usize) -> String;
     fn resolve_label(&self, label: &str) -> Option<usize>;
     fn notes_for_page(&self, index: usize, mode: NotesMode) -> Option<String>;
     fn detect_notes_layout(&self, index: usize, mode: NotesMode) -> Result<NotesDetectionResult>;
+    /// Returns the notes layout when it can be determined without rendering the page.
+    /// `None` means detection needs a render, which [`detect_notes_layout_from_path`] performs
+    /// off the UI thread.
+    fn detect_notes_layout_without_render(
+        &self,
+        index: usize,
+        mode: NotesMode,
+    ) -> Option<Result<NotesDetectionResult>>;
     fn render_page_bitmap(
         &self,
         index: usize,
@@ -198,7 +208,8 @@ pub trait DocumentBackend {
     fn has_unsaved_changes(&self) -> bool;
     fn save_in_place(&mut self) -> Result<()>;
     fn save_as(&mut self, path: &Path) -> Result<()>;
-    fn reload_if_changed(&mut self) -> Result<bool>;
+    /// Reports whether the file was modified externally since it was opened or saved.
+    fn has_changed_on_disk(&self) -> Result<bool>;
     fn outline_path_for_page(&self, _index: usize) -> Option<Vec<String>> {
         None
     }

@@ -1,14 +1,14 @@
 use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
 use fs2::FileExt;
-use pdfium_render::prelude::Pdfium;
+use pdfium_render::prelude::{PdfDocument, Pdfium};
 use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, SystemTime};
 
 const PDFIUM_VERSION: &str = "7961";
 const PDFIUM_RELEASE: &str = "152.0.7961.0";
@@ -100,7 +100,7 @@ const WINDOWS_X86_64: PlatformInfo = PlatformInfo {
 
 static RESOLUTION_MUTEX: Mutex<()> = Mutex::new(());
 static PDFIUM_INSTANCE: OnceLock<Pdfium> = OnceLock::new();
-static PDFIUM_FFI_MUTEX: Mutex<()> = Mutex::new(());
+static PDFIUM_FFI_MUTEX: Mutex<Option<CachedPdfiumDocument>> = Mutex::new(None);
 static TEMPORARY_FILE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(super) fn bind_pdfium() -> anyhow::Result<Pdfium> {
@@ -128,29 +128,81 @@ pub(super) fn bind_pdfium() -> anyhow::Result<Pdfium> {
     }
 }
 
-pub(super) fn with_pdfium<T>(operation: impl FnOnce(&Pdfium) -> Result<T>) -> Result<T> {
-    let _ffi_guard = match PDFIUM_FFI_MUTEX.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+struct CachedPdfiumDocument {
+    path: PathBuf,
+    modified_at: Option<SystemTime>,
+    length: u64,
+    document: PdfDocument<'static>,
+}
 
-    if PDFIUM_INSTANCE.get().is_none() {
-        let pdfium = bind_pdfium()?;
-        match PDFIUM_INSTANCE.set(pdfium) {
-            Ok(()) => {}
-            Err(pdfium) => {
-                drop(pdfium);
-                return Err(anyhow::anyhow!(
-                    "PDFium instance initialization raced unexpectedly"
-                ));
-            }
-        }
+impl CachedPdfiumDocument {
+    fn matches(&self, path: &Path, metadata: &fs::Metadata) -> bool {
+        self.path == path
+            && self.length == metadata.len()
+            && self.modified_at == metadata.modified().ok()
+    }
+}
+
+fn pdfium_instance() -> Result<&'static Pdfium> {
+    if let Some(pdfium) = PDFIUM_INSTANCE.get() {
+        return Ok(pdfium);
     }
 
-    let pdfium = PDFIUM_INSTANCE
+    let pdfium = bind_pdfium()?;
+    if PDFIUM_INSTANCE.set(pdfium).is_err() {
+        bail!("PDFium instance initialization raced unexpectedly");
+    }
+    PDFIUM_INSTANCE
         .get()
-        .ok_or_else(|| anyhow::anyhow!("PDFium instance was not available after initialization"))?;
-    operation(pdfium)
+        .ok_or_else(|| anyhow::anyhow!("PDFium instance was not available after initialization"))
+}
+
+fn lock_pdfium_ffi() -> MutexGuard<'static, Option<CachedPdfiumDocument>> {
+    match PDFIUM_FFI_MUTEX.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Runs `operation` against the PDFium document for `path`.
+///
+/// Parsing a PDF is a large share of the cost of rendering one page, so the most recently
+/// used document stays open and is reused until the file's size or modification time changes.
+pub(super) fn with_pdfium_document<T>(
+    path: &Path,
+    operation: impl FnOnce(&PdfDocument<'static>) -> Result<T>,
+) -> Result<T> {
+    let mut cached_document = lock_pdfium_ffi();
+    let pdfium = pdfium_instance()?;
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+
+    let cache_is_current = cached_document
+        .as_ref()
+        .is_some_and(|cached| cached.matches(path, &metadata));
+    if !cache_is_current {
+        // Close the previous document before opening the next one so two copies are never resident.
+        *cached_document = None;
+        let document = pdfium
+            .load_pdf_from_file(path, None)
+            .with_context(|| format!("failed to load PDF with PDFium: {}", path.display()))?;
+        *cached_document = Some(CachedPdfiumDocument {
+            path: path.to_path_buf(),
+            modified_at: metadata.modified().ok(),
+            length: metadata.len(),
+            document,
+        });
+    }
+
+    let cached = cached_document
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("PDFium document cache was empty after loading"))?;
+    operation(&cached.document)
+}
+
+/// Closes the cached PDFium document so its file handle is released before the file is rewritten.
+pub(crate) fn release_cached_pdfium_document() {
+    *lock_pdfium_ffi() = None;
 }
 
 fn platform_info(os: &str, arch: &str) -> Result<&'static PlatformInfo> {

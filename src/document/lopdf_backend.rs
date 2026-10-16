@@ -1,4 +1,5 @@
 use super::pdfium_renderer::render_page_bitmap_from_path;
+use super::pdfium_runtime::release_cached_pdfium_document;
 use crate::config::{NotesLayout, NotesMode, NotesSide, SplitAxis};
 use crate::document::{
     AnnotationMetadata, AnnotationPriority, AnnotationStatus, DocumentBackend, NewInkAnnotation,
@@ -53,6 +54,7 @@ struct OutlineEntry {
 
 const AUTO_CONFIDENCE_MIN: f32 = 0.12;
 const MODE_CONFIDENCE_MIN: f32 = 0.20;
+const LAYOUT_DETECTION_RENDER_WIDTH: usize = 1280;
 const META_PREFIX: &str = "[[PDFPRESENTER_META:";
 const META_SUFFIX: &str = "]]";
 
@@ -82,21 +84,13 @@ impl LopdfBackend {
         })
     }
 
-    fn reload(&mut self) -> Result<()> {
-        self.document = Document::load(&self.path)
-            .with_context(|| format!("failed to reload {}", self.path.display()))?;
-        self.page_count = self.document.get_pages().len();
-        self.outline_paths_by_page =
-            Self::build_outline_paths_by_page(&self.document, self.page_count);
-        self.has_unsaved_changes = false;
-        Ok(())
-    }
-
     fn decode_pdf_text(bytes: &[u8]) -> String {
         if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
             let utf16_units: Vec<u16> = bytes[2..]
-                .chunks_exact(2)
-                .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|chunk| u16::from_be_bytes(*chunk))
                 .collect();
             if let Ok(decoded) = String::from_utf16(&utf16_units) {
                 let trimmed = decoded.trim();
@@ -614,6 +608,7 @@ impl LopdfBackend {
     }
 
     fn save_to_path(&mut self, path: &Path) -> Result<()> {
+        release_cached_pdfium_document();
         self.document
             .save(path)
             .with_context(|| format!("failed to save {}", path.display()))?;
@@ -1031,10 +1026,24 @@ impl LopdfBackend {
     ) -> usize {
         super::pdfium_renderer::effective_render_width(target_width, view, layout)
     }
+}
 
-    fn render_full_page(&self, index: usize, target_width: usize) -> Result<PageBitmap> {
-        render_page_bitmap_from_path(&self.path, index, PageView::Full, None, target_width)
-    }
+/// Renders the page and detects where its notes split is.
+///
+/// This renders a full page, so the app runs it on the render worker instead of the UI thread.
+pub(crate) fn detect_notes_layout_from_path(
+    path: &Path,
+    index: usize,
+    mode: NotesMode,
+) -> Result<NotesDetectionResult> {
+    let full = render_page_bitmap_from_path(
+        path,
+        index,
+        PageView::Full,
+        None,
+        LAYOUT_DETECTION_RENDER_WIDTH,
+    )?;
+    Ok(LopdfBackend::detect_layout_for_mode(&full, mode))
 }
 
 impl DocumentBackend for LopdfBackend {
@@ -1084,16 +1093,25 @@ impl DocumentBackend for LopdfBackend {
     }
 
     fn detect_notes_layout(&self, index: usize, mode: NotesMode) -> Result<NotesDetectionResult> {
-        if mode == NotesMode::PdfAnnotations {
-            return Ok(NotesDetectionResult {
+        if let Some(result) = self.detect_notes_layout_without_render(index, mode) {
+            return result;
+        }
+        detect_notes_layout_from_path(&self.path, index, mode)
+    }
+
+    fn detect_notes_layout_without_render(
+        &self,
+        _index: usize,
+        mode: NotesMode,
+    ) -> Option<Result<NotesDetectionResult>> {
+        (mode == NotesMode::PdfAnnotations).then(|| {
+            Ok(NotesDetectionResult {
                 layout: None,
                 confidence: 1.0,
                 reason: "PDF annotations mode uses full-page rendering.".to_owned(),
                 warning: None,
-            });
-        }
-        let full = self.render_full_page(index, 1280)?;
-        Ok(Self::detect_layout_for_mode(&full, mode))
+            })
+        })
     }
 
     fn render_page_bitmap(
@@ -1395,27 +1413,18 @@ impl DocumentBackend for LopdfBackend {
         self.save_to_path(path)
     }
 
-    fn reload_if_changed(&mut self) -> Result<bool> {
+    fn has_changed_on_disk(&self) -> Result<bool> {
         if self.has_unsaved_changes {
             return Ok(false);
         }
 
         let metadata = std::fs::metadata(&self.path)
             .with_context(|| format!("failed to read metadata for {}", self.path.display()))?;
-        let modified = metadata.modified().ok();
-        let changed = match (self.modified_at, modified) {
+        Ok(match (self.modified_at, metadata.modified().ok()) {
             (Some(previous), Some(current)) => current > previous,
             (None, Some(_)) => true,
             _ => false,
-        };
-
-        if changed {
-            self.reload()?;
-            self.modified_at = modified;
-            return Ok(true);
-        }
-
-        Ok(false)
+        })
     }
 }
 
@@ -1424,8 +1433,8 @@ mod tests {
     use super::LopdfBackend;
     use crate::config::{NotesLayout, NotesMode, NotesSide, SplitAxis};
     use crate::document::{
-        AnnotationMetadata, AnnotationPriority, AnnotationStatus, DocumentBackend,
-        NewTextAnnotation, PdfRect,
+        AnnotationMetadata, AnnotationPriority, AnnotationStatus, DocumentBackend, InkStroke,
+        NewInkAnnotation, NewTextAnnotation, PdfRect,
     };
     use crate::document::{PageBitmap, PageView};
     use lopdf::{Dictionary, Document, Object};
@@ -1460,6 +1469,71 @@ mod tests {
             layout.notes_side,
             NotesSide::Right,
             "fixture expected notes on right side"
+        );
+    }
+
+    #[test]
+    fn only_pdf_annotations_mode_resolves_layout_without_rendering_when_fixture_present() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Information Geometry.pdf");
+        if !fixture.exists() {
+            return;
+        }
+
+        let backend = LopdfBackend::open(&fixture).expect("fixture should load");
+        assert!(
+            backend
+                .detect_notes_layout_without_render(0, NotesMode::PdfAnnotations)
+                .is_some()
+        );
+        assert!(
+            backend
+                .detect_notes_layout_without_render(0, NotesMode::Auto)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rendering_after_save_reflects_the_rewritten_file_when_fixture_present() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Information Geometry.pdf");
+        if !fixture.exists() {
+            return;
+        }
+
+        let temp = tempdir().expect("create temp directory");
+        let copied_pdf = temp.path().join("cached-render.pdf");
+        std::fs::copy(&fixture, &copied_pdf).expect("copy fixture");
+        let mut backend = LopdfBackend::open(&copied_pdf).expect("open copied fixture");
+        let before = backend
+            .render_page_bitmap(0, PageView::Full, None, 640)
+            .expect("render before save");
+
+        backend
+            .add_ink_annotation(
+                0,
+                NewInkAnnotation {
+                    rect: PdfRect {
+                        left: 20.0,
+                        bottom: 20.0,
+                        right: 300.0,
+                        top: 200.0,
+                    },
+                    strokes: vec![InkStroke {
+                        points: vec![(30.0, 30.0), (290.0, 190.0), (30.0, 190.0)],
+                    }],
+                    color_rgb: (1.0, 0.0, 0.0),
+                    opacity: 1.0,
+                    width: 12.0,
+                },
+            )
+            .expect("add ink annotation");
+        backend.save_in_place().expect("save in place");
+        let after = backend
+            .render_page_bitmap(0, PageView::Full, None, 640)
+            .expect("render after save");
+
+        assert_ne!(
+            before.rgba, after.rgba,
+            "the cached PDFium document should be replaced once the file is rewritten"
         );
     }
 

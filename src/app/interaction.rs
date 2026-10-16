@@ -94,13 +94,13 @@ pub(super) struct PenStrokeStyle {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct HighlightOverlaySnapshot {
-    pub(super) strokes: Vec<SessionInkStroke>,
-    pub(super) selected_stroke_ids: BTreeSet<String>,
-    pub(super) stroke_in_progress: Vec<(f32, f32)>,
+pub(super) struct HighlightOverlaySnapshot<'a> {
+    pub(super) strokes: &'a [SessionInkStroke],
+    pub(super) selected_stroke_ids: &'a BTreeSet<String>,
+    pub(super) stroke_in_progress: &'a [(f32, f32)],
     pub(super) stroke_in_progress_style: Option<PenStrokeStyle>,
     pub(super) active_highlight_tool: HighlightTool,
-    pub(super) lasso_path_in_progress: Vec<(f32, f32)>,
+    pub(super) lasso_path_in_progress: &'a [(f32, f32)],
 }
 
 #[derive(Debug, Clone, Copy)]

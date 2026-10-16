@@ -1,4 +1,5 @@
 mod command;
+mod document_loader;
 mod interaction;
 mod overview;
 mod presenter;
@@ -12,6 +13,7 @@ mod timing;
 pub use command::AppCommand;
 pub use state::PresentationState;
 
+use self::document_loader::{DocumentLoad, DocumentLoadKind};
 use self::interaction::{
     ActiveTextTransform, HighlightOverlaySnapshot, HighlightOverlaySurface, HighlightTool,
     InteractionMode, LaserSurfaceSample, PenStrokeStyle, PendingUnsavedAction, ResizeHandle,
@@ -20,7 +22,10 @@ use self::interaction::{
 use self::overview::DeckOverviewState;
 use self::presenter::{CachedResolvedLayout, PresenterApp};
 use self::render_cache::CachedTexture;
-use self::render_worker::{RenderJob, RenderJobKey, RenderPriority, RenderResult, RenderWorker};
+use self::render_worker::{
+    RenderJob, RenderJobKey, RenderJobKind, RenderPriority, RenderResult, RenderTask, RenderWorker,
+    resolve_detected_layout,
+};
 use self::shortcuts::{ShortcutAction, ShortcutBindings};
 use self::theme::{ThemePalette, card_frame, inset_frame, install_visual_style, quiet_label};
 use self::theme::{pill_text, section_title, status_pill, theme_label};
@@ -32,7 +37,7 @@ use crate::config::{
 };
 use crate::document::{
     AnnotationMetadata, AnnotationPriority, AnnotationStatus, DocumentBackend, NewInkAnnotation,
-    NewTextAnnotation, PageGeometry, PageView, PdfRect, TextAnnotation, open_document,
+    NewTextAnnotation, PageGeometry, PageView, PdfRect, TextAnnotation,
 };
 use anyhow::{Result, anyhow};
 use chrono::Local;
@@ -56,6 +61,13 @@ enum SecondaryTextureSlot {
 enum CriticalTextureSlot {
     Projector,
     Current,
+}
+
+/// A slide's notes layout, or `Pending` while the render worker is still detecting it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LayoutResolution {
+    Resolved(Option<NotesLayout>),
+    Pending,
 }
 
 #[derive(Clone)]
@@ -146,8 +158,14 @@ impl PresenterApp {
             status_message: Some("Ready. Choose a PDF to begin.".to_owned()),
             last_reload_check: now,
             non_critical_texture_refresh_after: None,
-            render_worker: RenderWorker::start(),
+            render_worker: RenderWorker::start(cc.egui_ctx.clone()),
             render_document_generation: 0,
+            render_request_generation: 0,
+            failed_render_keys: BTreeSet::new(),
+            egui_context: cc.egui_ctx.clone(),
+            document_load: None,
+            outline_paths_by_page: Vec::new(),
+            last_root_title: None,
             projector_viewport: ViewportId::from_hash_of("projector_window"),
             single_monitor_zoom_share: false,
             projector_texture: None,
@@ -220,9 +238,7 @@ impl PresenterApp {
 
         if let Some(path) = initial_source {
             app.source_path_input = path.display().to_string();
-            if let Err(error) = app.load_document(path) {
-                app.open_error = Some(error.to_string());
-            }
+            app.start_document_load(path, DocumentLoadKind::Open);
         }
 
         app
@@ -1018,8 +1034,50 @@ impl PresenterApp {
         self.layout_warning = None;
     }
 
-    fn load_document(&mut self, path: PathBuf) -> Result<()> {
-        let backend = open_document(&path)?;
+    fn start_document_load(&mut self, path: PathBuf, kind: DocumentLoadKind) {
+        match DocumentLoad::start(path, kind, self.egui_context.clone()) {
+            Ok(load) => {
+                if kind == DocumentLoadKind::Open {
+                    self.status_message = Some(format!("Opening {}…", load.path().display()));
+                }
+                self.document_load = Some(load);
+            }
+            Err(error) => {
+                self.open_error = Some(format!("Failed to start loading the PDF: {error}"));
+            }
+        }
+    }
+
+    fn poll_document_load(&mut self) {
+        let Some(result) = self
+            .document_load
+            .as_ref()
+            .and_then(DocumentLoad::try_finish)
+        else {
+            return;
+        };
+        let Some(load) = self.document_load.take() else {
+            return;
+        };
+
+        match (load.kind(), result) {
+            (DocumentLoadKind::Open, Ok(backend)) => {
+                self.install_document(load.path(), backend);
+            }
+            (DocumentLoadKind::Open, Err(error)) => {
+                self.status_message = None;
+                self.open_error = Some(error.to_string());
+            }
+            (DocumentLoadKind::Reload, Ok(backend)) => {
+                self.install_reloaded_document(load.path(), backend);
+            }
+            (DocumentLoadKind::Reload, Err(error)) => {
+                self.open_error = Some(format!("Failed to auto-reload document: {error}"));
+            }
+        }
+    }
+
+    fn install_document(&mut self, path: &Path, backend: Box<dyn DocumentBackend>) {
         let fingerprint = Self::document_fingerprint(backend.source_path());
         let labels = Self::labels_from_backend(backend.as_ref());
         let total_slides = backend.page_count();
@@ -1027,6 +1085,7 @@ impl PresenterApp {
             .update_document(total_slides, labels, Instant::now());
         self.deck_overview.selected_index = self.state.current_index();
         self.state.projector_fullscreen = self.config.startup_content_fullscreen;
+        self.outline_paths_by_page = Self::outline_paths_from_backend(backend.as_ref());
         self.document = Some(backend);
         self.current_document_fingerprint = Some(fingerprint);
         self.apply_saved_override_for_current_document();
@@ -1065,12 +1124,17 @@ impl PresenterApp {
             path.display()
         ));
         self.open_error = None;
-        Ok(())
     }
 
     fn labels_from_backend(backend: &dyn DocumentBackend) -> Vec<String> {
         (0..backend.page_count())
             .map(|index| backend.page_label(index))
+            .collect()
+    }
+
+    fn outline_paths_from_backend(backend: &dyn DocumentBackend) -> Vec<Option<Vec<String>>> {
+        (0..backend.page_count())
+            .map(|index| backend.outline_path_for_page(index))
             .collect()
     }
 
@@ -1081,7 +1145,7 @@ impl PresenterApp {
         if self.state.apply(command, now) {
             let changed_slide = self.state.current_index() != previous_index;
             if changed_slide {
-                self.advance_render_generation();
+                self.advance_request_generation();
                 self.text_annotation_cache_index = None;
                 self.selected_annotation_id = None;
                 self.active_text_transform = None;
@@ -1137,7 +1201,7 @@ impl PresenterApp {
 
         let now = Instant::now();
         if self.state.maybe_auto_advance(now) {
-            self.advance_render_generation();
+            self.advance_request_generation();
             self.text_annotation_cache_index = None;
             self.selected_annotation_id = None;
             self.active_text_transform = None;
@@ -1189,9 +1253,7 @@ impl PresenterApp {
             return;
         }
 
-        if let Err(error) = self.load_document(path) {
-            self.open_error = Some(error.to_string());
-        }
+        self.start_document_load(path, DocumentLoadKind::Open);
     }
 
     fn open_pdf_dialog(&self) -> Option<PathBuf> {
@@ -1213,9 +1275,7 @@ impl PresenterApp {
     fn execute_pending_unsaved_action(&mut self, ctx: &Context, action: PendingUnsavedAction) {
         match action {
             PendingUnsavedAction::Load(path) => {
-                if let Err(error) = self.load_document(path) {
-                    self.open_error = Some(error.to_string());
-                }
+                self.start_document_load(path, DocumentLoadKind::Open);
             }
             PendingUnsavedAction::Close => {
                 self.allow_close_without_guard = true;
@@ -2733,7 +2793,7 @@ impl PresenterApp {
         }
     }
 
-    fn highlight_overlay_snapshot_for_index(&self, index: usize) -> HighlightOverlaySnapshot {
+    fn highlight_overlay_snapshot_for_index(&self, index: usize) -> HighlightOverlaySnapshot<'_> {
         let stroke_in_progress_style = self.stroke_in_progress_style.or_else(|| {
             if self.active_highlight_tool != HighlightTool::Draw {
                 None
@@ -2751,26 +2811,26 @@ impl PresenterApp {
             strokes: self
                 .unsaved_strokes
                 .get(&index)
-                .cloned()
+                .map(Vec::as_slice)
                 .unwrap_or_default(),
-            selected_stroke_ids: self.selected_stroke_ids.clone(),
-            stroke_in_progress: self.stroke_in_progress.clone(),
+            selected_stroke_ids: &self.selected_stroke_ids,
+            stroke_in_progress: &self.stroke_in_progress,
             stroke_in_progress_style,
             active_highlight_tool: self.active_highlight_tool,
-            lasso_path_in_progress: self.lasso_path_in_progress.clone(),
+            lasso_path_in_progress: &self.lasso_path_in_progress,
         }
     }
 
     fn draw_highlight_overlay_from_snapshot(
         ui: &egui::Ui,
         surface: HighlightOverlaySurface,
-        overlay: &HighlightOverlaySnapshot,
+        overlay: &HighlightOverlaySnapshot<'_>,
         show_selected_strokes: bool,
         show_lasso: bool,
     ) {
         let painter = ui.painter().with_clip_rect(surface.clip_rect);
 
-        for stroke in &overlay.strokes {
+        for stroke in overlay.strokes {
             let stroke_style = Stroke::new(
                 stroke.width,
                 Self::color32_from_rgb_opacity(stroke.color_rgb, stroke.opacity),
@@ -3340,44 +3400,60 @@ impl PresenterApp {
         }
 
         self.last_reload_check = Instant::now();
-        if self.has_unsaved_annotation_changes() {
+        if self.has_unsaved_annotation_changes() || self.document_load.is_some() {
             return;
         }
-        let Some(document) = self.document.as_mut() else {
+        let Some(document) = self.document.as_ref() else {
             return;
         };
 
-        match document.reload_if_changed() {
+        match document.has_changed_on_disk() {
             Ok(true) => {
-                let current = self.state.current_index();
-                let auto_enabled = self.state.auto_advance_enabled();
-                let (global_interval, overrides) = self.state.auto_advance_profile();
-                let labels = Self::labels_from_backend(document.as_ref());
-                self.state
-                    .update_document(document.page_count(), labels, Instant::now());
-                self.state
-                    .set_auto_advance_profile(global_interval, overrides, Instant::now());
-                self.state.apply(
-                    AppCommand::SetAutoAdvanceEnabled(auto_enabled),
-                    Instant::now(),
-                );
-                let capped = current.min(self.state.total_slides() - 1);
-                self.apply_command(AppCommand::GoToIndex(capped));
-                self.unsaved_strokes.clear();
-                self.stroke_undo_stack.clear();
-                self.stroke_in_progress.clear();
-                self.stroke_in_progress_style = None;
-                self.eraser_erased_in_drag.clear();
-                self.eraser_removed_this_drag = false;
-                self.non_highlight_unsaved_changes = false;
-                self.invalidate_render_cache();
-                self.status_message = Some("PDF reloaded after file change.".to_owned());
+                let path = document.source_path().to_path_buf();
+                self.start_document_load(path, DocumentLoadKind::Reload);
             }
             Ok(false) => {}
             Err(error) => {
                 self.open_error = Some(format!("Failed to auto-reload document: {error}"));
             }
         }
+    }
+
+    fn install_reloaded_document(&mut self, path: &Path, backend: Box<dyn DocumentBackend>) {
+        let still_current = self
+            .document
+            .as_ref()
+            .is_some_and(|document| document.source_path() == path);
+        // Edits made while the reload was parsing win; the next change check retries the reload.
+        if !still_current || self.has_unsaved_annotation_changes() {
+            return;
+        }
+
+        let current = self.state.current_index();
+        let auto_enabled = self.state.auto_advance_enabled();
+        let (global_interval, overrides) = self.state.auto_advance_profile();
+        let labels = Self::labels_from_backend(backend.as_ref());
+        self.outline_paths_by_page = Self::outline_paths_from_backend(backend.as_ref());
+        self.state
+            .update_document(backend.page_count(), labels, Instant::now());
+        self.document = Some(backend);
+        self.state
+            .set_auto_advance_profile(global_interval, overrides, Instant::now());
+        self.state.apply(
+            AppCommand::SetAutoAdvanceEnabled(auto_enabled),
+            Instant::now(),
+        );
+        let capped = current.min(self.state.total_slides().saturating_sub(1));
+        self.apply_command(AppCommand::GoToIndex(capped));
+        self.unsaved_strokes.clear();
+        self.stroke_undo_stack.clear();
+        self.stroke_in_progress.clear();
+        self.stroke_in_progress_style = None;
+        self.eraser_erased_in_drag.clear();
+        self.eraser_removed_this_drag = false;
+        self.non_highlight_unsaved_changes = false;
+        self.invalidate_render_cache();
+        self.status_message = Some("PDF reloaded after file change.".to_owned());
     }
 
     fn persist_config(&mut self) {
@@ -3483,20 +3559,27 @@ impl PresenterApp {
     }
 
     fn invalidate_render_cache(&mut self) {
-        self.advance_render_generation();
+        self.advance_document_generation();
         self.clear_all_active_textures();
         self.clear_overview_textures();
         self.texture_cache = PageCache::new(self.config.cache_size, self.cache_budget_bytes());
+        self.failed_render_keys.clear();
         self.reset_layout_resolution();
         self.text_annotation_cache_index = None;
         self.original_text_annotations.clear();
         self.active_text_transform = None;
     }
 
-    fn advance_render_generation(&mut self) {
+    fn advance_document_generation(&mut self) {
         self.render_document_generation = self.render_document_generation.wrapping_add(1);
         self.render_worker
-            .set_latest_generation(self.render_document_generation);
+            .set_document_generation(self.render_document_generation);
+    }
+
+    fn advance_request_generation(&mut self) {
+        self.render_request_generation = self.render_request_generation.wrapping_add(1);
+        self.render_worker
+            .set_request_generation(self.render_request_generation);
     }
 
     fn defer_non_critical_texture_refresh(&mut self, duration: Duration) {
@@ -3697,88 +3780,6 @@ impl PresenterApp {
         (target_width / 2).clamp(360, 1200).min(target_width)
     }
 
-    fn get_or_render_texture(
-        &mut self,
-        ctx: &Context,
-        index: usize,
-        view: PageView,
-        layout: Option<NotesLayout>,
-        target_width: usize,
-        namespace: usize,
-    ) -> Result<ProgressiveTexture> {
-        let key = Self::texture_cache_key(
-            index,
-            self.config.notes_mode,
-            view,
-            layout,
-            target_width,
-            namespace,
-        );
-        if let Some(entry) = self.texture_cache.get(key) {
-            return Ok(ProgressiveTexture {
-                target_key: key,
-                texture_key: Some(key),
-                texture: Some(entry.texture.clone()),
-                is_low_res: false,
-            });
-        }
-
-        let low_res_width = Self::low_res_render_width(target_width);
-        if low_res_width < target_width {
-            let low_res_key = Self::texture_cache_key(
-                index,
-                self.config.notes_mode,
-                view,
-                layout,
-                low_res_width,
-                namespace,
-            );
-            self.request_background_render(BackgroundRenderRequest {
-                cache_key: key,
-                index,
-                view,
-                layout,
-                target_width,
-                namespace,
-                priority: RenderPriority::High,
-            });
-            if let Some(entry) = self.texture_cache.get(low_res_key) {
-                return Ok(ProgressiveTexture {
-                    target_key: key,
-                    texture_key: Some(low_res_key),
-                    texture: Some(entry.texture.clone()),
-                    is_low_res: true,
-                });
-            }
-
-            let document = self
-                .document
-                .as_ref()
-                .ok_or_else(|| anyhow!("no document loaded"))?;
-            let bitmap = document.render_page_bitmap(index, view, layout, low_res_width)?;
-            let texture = self.upload_bitmap_texture(ctx, low_res_key, namespace, bitmap);
-            return Ok(ProgressiveTexture {
-                target_key: key,
-                texture_key: Some(low_res_key),
-                texture: Some(texture),
-                is_low_res: true,
-            });
-        }
-
-        let document = self
-            .document
-            .as_ref()
-            .ok_or_else(|| anyhow!("no document loaded"))?;
-        let bitmap = document.render_page_bitmap(index, view, layout, target_width)?;
-        let texture = self.upload_bitmap_texture(ctx, key, namespace, bitmap);
-        Ok(ProgressiveTexture {
-            target_key: key,
-            texture_key: Some(key),
-            texture: Some(texture),
-            is_low_res: false,
-        })
-    }
-
     fn cached_or_request_texture(
         &mut self,
         index: usize,
@@ -3805,7 +3806,7 @@ impl PresenterApp {
             };
         }
 
-        self.request_background_render(BackgroundRenderRequest {
+        let full_resolution_request = BackgroundRenderRequest {
             cache_key: key,
             index,
             view,
@@ -3813,8 +3814,7 @@ impl PresenterApp {
             target_width,
             namespace,
             priority,
-        });
-
+        };
         let low_res_width = Self::low_res_render_width(target_width);
         if low_res_width < target_width {
             let low_res_key = Self::texture_cache_key(
@@ -3826,24 +3826,24 @@ impl PresenterApp {
                 namespace,
             );
             if let Some(entry) = self.texture_cache.get(low_res_key) {
+                let texture = entry.texture.clone();
+                self.request_background_render(full_resolution_request);
                 return ProgressiveTexture {
                     target_key: key,
                     texture_key: Some(low_res_key),
-                    texture: Some(entry.texture.clone()),
+                    texture: Some(texture),
                     is_low_res: true,
                 };
             }
 
+            // Queued ahead of the full-resolution render so a preview appears sooner.
             self.request_background_render(BackgroundRenderRequest {
                 cache_key: low_res_key,
-                index,
-                view,
-                layout,
                 target_width: low_res_width,
-                namespace,
-                priority,
+                ..full_resolution_request
             });
         }
+        self.request_background_render(full_resolution_request);
 
         ProgressiveTexture {
             target_key: key,
@@ -3854,7 +3854,11 @@ impl PresenterApp {
     }
 
     fn request_background_render(&mut self, request: BackgroundRenderRequest) {
-        if self.texture_cache.contains(request.cache_key) {
+        // Failed pages are not retried until the document or render settings change, otherwise
+        // every repaint would queue the same failing render again.
+        if self.texture_cache.contains(request.cache_key)
+            || self.failed_render_keys.contains(&request.cache_key)
+        {
             return;
         }
         let Some(document) = self.document.as_ref() else {
@@ -3863,30 +3867,64 @@ impl PresenterApp {
 
         let job = RenderJob {
             key: RenderJobKey {
+                kind: RenderJobKind::Page,
                 cache_key: request.cache_key,
                 document_generation: self.render_document_generation,
             },
+            request_generation: self.render_request_generation,
             source_path: document.source_path().to_path_buf(),
             index: request.index,
             mode: self.config.notes_mode,
-            view: request.view,
-            layout: request.layout,
-            target_width: request.target_width,
-            namespace: request.namespace,
+            task: RenderTask::Page {
+                view: request.view,
+                layout: request.layout,
+                target_width: request.target_width,
+                namespace: request.namespace,
+            },
             priority: request.priority,
         };
-        self.render_worker.request(job);
+        if let Err(error) = self.render_worker.request(job) {
+            self.open_error = Some(error.to_string());
+        }
     }
 
-    fn upload_bitmap_texture(
+    fn request_layout_detection(
+        &mut self,
+        index: usize,
+        resolution_key: usize,
+        priority: RenderPriority,
+    ) {
+        let Some(document) = self.document.as_ref() else {
+            return;
+        };
+
+        let job = RenderJob {
+            key: RenderJobKey {
+                kind: RenderJobKind::Layout,
+                cache_key: resolution_key,
+                document_generation: self.render_document_generation,
+            },
+            request_generation: self.render_request_generation,
+            source_path: document.source_path().to_path_buf(),
+            index,
+            mode: self.config.notes_mode,
+            task: RenderTask::DetectLayout {
+                confidence_threshold: self.config.notes_confidence_threshold,
+            },
+            priority,
+        };
+        if let Err(error) = self.render_worker.request(job) {
+            self.open_error = Some(error.to_string());
+        }
+    }
+
+    fn upload_texture(
         &mut self,
         ctx: &Context,
         key: usize,
         namespace: usize,
-        bitmap: crate::document::PageBitmap,
-    ) -> TextureHandle {
-        let image =
-            egui::ColorImage::from_rgba_unmultiplied([bitmap.width, bitmap.height], &bitmap.rgba);
+        image: egui::ColorImage,
+    ) {
         let texture = ctx.load_texture(
             format!("page_texture_{namespace}_{key}"),
             image,
@@ -3897,11 +3935,10 @@ impl PresenterApp {
         self.texture_cache.put(
             key,
             CachedTexture {
-                texture: texture.clone(),
+                texture,
                 byte_estimate,
             },
         );
-        texture
     }
 
     fn apply_background_render_results(&mut self, ctx: &Context) {
@@ -3911,8 +3948,11 @@ impl PresenterApp {
                 RenderResult::Ready {
                     key,
                     namespace,
-                    bitmap,
+                    image,
                 } => {
+                    if key.document_generation != self.render_document_generation {
+                        continue;
+                    }
                     if namespace == 2
                         && !Self::overview_result_is_current(
                             self.deck_overview.is_open,
@@ -3922,17 +3962,21 @@ impl PresenterApp {
                     {
                         continue;
                     }
-                    if key.document_generation != self.render_document_generation {
-                        continue;
-                    }
                     if !self.texture_cache.contains(key.cache_key) {
-                        drop(self.upload_bitmap_texture(ctx, key.cache_key, namespace, bitmap));
+                        self.upload_texture(ctx, key.cache_key, namespace, image);
                     }
                     applied_result = true;
+                }
+                RenderResult::LayoutReady { key, resolved } => {
+                    if key.document_generation == self.render_document_generation {
+                        self.resolved_layout_cache.insert(key.cache_key, resolved);
+                        applied_result = true;
+                    }
                 }
                 RenderResult::Cancelled { .. } => {}
                 RenderResult::Failed { key, message } => {
                     if key.document_generation == self.render_document_generation {
+                        self.failed_render_keys.insert(key.cache_key);
                         self.open_error = Some(message);
                         applied_result = true;
                     }
@@ -3956,10 +4000,16 @@ impl PresenterApp {
         self.resolved_layout
     }
 
-    fn resolve_layout_for_slide(&mut self, index: usize) -> Option<NotesLayout> {
+    fn resolve_layout_for_slide(
+        &mut self,
+        index: usize,
+        priority: RenderPriority,
+    ) -> LayoutResolution {
         let resolution_key = self.layout_resolution_key(index);
         if let Some(cached) = self.resolved_layout_cache.get(&resolution_key).cloned() {
-            return self.apply_cached_resolved_layout(resolution_key, cached);
+            return LayoutResolution::Resolved(
+                self.apply_cached_resolved_layout(resolution_key, cached),
+            );
         }
 
         let cached = if let Some(layout) = self.active_override_layout() {
@@ -3977,50 +4027,39 @@ impl PresenterApp {
                 };
                 self.resolved_layout_cache
                     .insert(resolution_key, cached.clone());
-                return self.apply_cached_resolved_layout(resolution_key, cached);
+                return LayoutResolution::Resolved(
+                    self.apply_cached_resolved_layout(resolution_key, cached),
+                );
             };
 
-            match document.detect_notes_layout(index, self.config.notes_mode) {
-                Ok(result) => {
-                    let mut warning = result.warning.clone();
-                    let resolved = if self.config.notes_mode == NotesMode::Auto {
-                        match result.layout {
-                            Some(layout)
-                                if result.confidence >= self.config.notes_confidence_threshold =>
-                            {
-                                Some(layout)
-                            }
-                            _ => {
-                                warning = Some(format!(
-                                    "Auto split confidence {:.2} below threshold {:.2}; using full page.",
-                                    result.confidence, self.config.notes_confidence_threshold
-                                ));
-                                None
-                            }
-                        }
-                    } else {
-                        result.layout
-                    };
-                    CachedResolvedLayout {
-                        layout: resolved,
-                        reason: Some(result.reason),
-                        warning,
-                    }
+            match document.detect_notes_layout_without_render(index, self.config.notes_mode) {
+                Some(detection) => resolve_detected_layout(
+                    self.config.notes_mode,
+                    self.config.notes_confidence_threshold,
+                    detection,
+                ),
+                None => {
+                    self.request_layout_detection(index, resolution_key, priority);
+                    return LayoutResolution::Pending;
                 }
-                Err(error) => CachedResolvedLayout {
-                    layout: None,
-                    reason: Some("Falling back to full-page rendering.".to_owned()),
-                    warning: Some(format!("Layout detection failed: {error}")),
-                },
             }
         };
 
         self.resolved_layout_cache
             .insert(resolution_key, cached.clone());
-        self.apply_cached_resolved_layout(resolution_key, cached)
+        LayoutResolution::Resolved(self.apply_cached_resolved_layout(resolution_key, cached))
     }
 
-    fn refresh_textures(&mut self, ctx: &Context) {
+    /// While detection for `index` is pending, the last resolved layout stands in so the
+    /// presenter panels keep their arrangement.
+    fn layout_for_display(&mut self, index: usize) -> Option<NotesLayout> {
+        match self.resolve_layout_for_slide(index, RenderPriority::High) {
+            LayoutResolution::Resolved(layout) => layout,
+            LayoutResolution::Pending => self.resolved_layout,
+        }
+    }
+
+    fn refresh_textures(&mut self) {
         if self.document.is_none() {
             self.clear_all_active_textures();
             return;
@@ -4040,11 +4079,27 @@ impl PresenterApp {
         };
         let next_index =
             (presenter_index + 1 < self.state.total_slides()).then_some(presenter_index + 1);
-        let projector_layout = (!self.state.screen_roles_swapped)
-            .then(|| self.resolve_layout_for_slide(projector_index))
-            .flatten();
-        let presenter_layout = self.resolve_layout_for_slide(presenter_index);
-        let next_layout = next_index.and_then(|index| self.resolve_layout_for_slide(index));
+        let projector_resolution = if self.state.screen_roles_swapped {
+            LayoutResolution::Resolved(None)
+        } else {
+            self.resolve_layout_for_slide(projector_index, RenderPriority::High)
+        };
+        let presenter_resolution =
+            self.resolve_layout_for_slide(presenter_index, RenderPriority::High);
+        let next_resolution = next_index.map(|index| {
+            (
+                index,
+                self.resolve_layout_for_slide(index, RenderPriority::Normal),
+            )
+        });
+        let (
+            LayoutResolution::Resolved(projector_layout),
+            LayoutResolution::Resolved(presenter_layout),
+        ) = (projector_resolution, presenter_resolution)
+        else {
+            // The previous textures stay on screen until detection finishes and wakes the UI.
+            return;
+        };
         let non_critical_refresh_ready = self.non_critical_texture_refresh_ready();
         let projector_slide_needed = !self.state.screen_roles_swapped
             && Self::has_visible_region(projector_layout, PageView::SlideOnly);
@@ -4061,68 +4116,44 @@ impl PresenterApp {
             Self::shared_slide_only_width(projector_width, presenter_width);
 
         if can_share_slide_only {
-            match self.get_or_render_texture(
-                ctx,
+            let progressive_texture = self.cached_or_request_texture(
                 presenter_index,
                 PageView::SlideOnly,
                 presenter_layout,
                 shared_slide_only_width,
                 1,
-            ) {
-                Ok(progressive_texture) => {
-                    self.update_critical_texture(
-                        progressive_texture.clone(),
-                        CriticalTextureSlot::Projector,
-                    );
-                    self.update_critical_texture(progressive_texture, CriticalTextureSlot::Current);
-                }
-                Err(error) => {
-                    self.open_error = Some(format!("Current slide render failed: {error}"));
-                }
-            }
+                RenderPriority::High,
+            );
+            self.update_critical_texture(
+                progressive_texture.clone(),
+                CriticalTextureSlot::Projector,
+            );
+            self.update_critical_texture(progressive_texture, CriticalTextureSlot::Current);
         } else {
             if projector_slide_needed {
-                match self.get_or_render_texture(
-                    ctx,
+                let progressive_texture = self.cached_or_request_texture(
                     projector_index,
                     PageView::SlideOnly,
                     projector_layout,
                     projector_width,
                     1,
-                ) {
-                    Ok(progressive_texture) => {
-                        self.update_critical_texture(
-                            progressive_texture,
-                            CriticalTextureSlot::Projector,
-                        );
-                    }
-                    Err(error) => {
-                        self.open_error = Some(format!("Projector render failed: {error}"));
-                    }
-                }
+                    RenderPriority::High,
+                );
+                self.update_critical_texture(progressive_texture, CriticalTextureSlot::Projector);
             } else {
                 self.clear_critical_texture(CriticalTextureSlot::Projector);
             }
 
             if current_slide_needed {
-                match self.get_or_render_texture(
-                    ctx,
+                let progressive_texture = self.cached_or_request_texture(
                     presenter_index,
                     PageView::SlideOnly,
                     presenter_layout,
                     presenter_width,
                     1,
-                ) {
-                    Ok(progressive_texture) => {
-                        self.update_critical_texture(
-                            progressive_texture,
-                            CriticalTextureSlot::Current,
-                        );
-                    }
-                    Err(error) => {
-                        self.open_error = Some(format!("Current slide render failed: {error}"));
-                    }
-                }
+                    RenderPriority::High,
+                );
+                self.update_critical_texture(progressive_texture, CriticalTextureSlot::Current);
             } else {
                 self.clear_critical_texture(CriticalTextureSlot::Current);
             }
@@ -4146,24 +4177,26 @@ impl PresenterApp {
             self.clear_secondary_texture(SecondaryTextureSlot::Presenter);
         }
 
-        if let Some(next_index) = next_index
-            && Self::has_visible_region(next_layout, PageView::SlideOnly)
-        {
-            let next_texture = self.cached_or_request_texture(
-                next_index,
-                PageView::SlideOnly,
-                next_layout,
-                next_width,
-                1,
-                RenderPriority::Normal,
-            );
-            self.update_secondary_texture(
-                next_texture,
-                non_critical_refresh_ready,
-                SecondaryTextureSlot::Next,
-            );
-        } else {
-            self.clear_secondary_texture(SecondaryTextureSlot::Next);
+        match next_resolution {
+            Some((next_index, LayoutResolution::Resolved(next_layout)))
+                if Self::has_visible_region(next_layout, PageView::SlideOnly) =>
+            {
+                let next_texture = self.cached_or_request_texture(
+                    next_index,
+                    PageView::SlideOnly,
+                    next_layout,
+                    next_width,
+                    1,
+                    RenderPriority::Normal,
+                );
+                self.update_secondary_texture(
+                    next_texture,
+                    non_critical_refresh_ready,
+                    SecondaryTextureSlot::Next,
+                );
+            }
+            Some((_, LayoutResolution::Pending)) => {}
+            _ => self.clear_secondary_texture(SecondaryTextureSlot::Next),
         }
 
         if Self::has_visible_region(presenter_layout, PageView::NotesOnly) {
@@ -4241,12 +4274,13 @@ impl PresenterApp {
         progressive_texture: ProgressiveTexture,
         slot: CriticalTextureSlot,
     ) {
+        // Until the worker delivers the new slide, the previous one stays up instead of a blank
+        // frame; a slide that failed to render must not leave the previous one on screen.
         let Some(texture) = progressive_texture.texture else {
-            let current_target_key = match slot {
-                CriticalTextureSlot::Projector => self.projector_texture_key,
-                CriticalTextureSlot::Current => self.current_texture_key,
-            };
-            if current_target_key != Some(progressive_texture.target_key) {
+            if self
+                .failed_render_keys
+                .contains(&progressive_texture.target_key)
+            {
                 self.clear_critical_texture(slot);
             }
             return;
@@ -4393,7 +4427,11 @@ impl PresenterApp {
             return;
         }
 
-        let next_layout = self.resolve_layout_for_slide(next_index);
+        let LayoutResolution::Resolved(next_layout) =
+            self.resolve_layout_for_slide(next_index, RenderPriority::Low)
+        else {
+            return;
+        };
         if !Self::has_visible_region(next_layout, PageView::SlideOnly) {
             return;
         }
@@ -4438,6 +4476,41 @@ impl PresenterApp {
             namespace: 1,
             priority: RenderPriority::Low,
         });
+    }
+
+    /// Time until something on screen changes without input: a clock or timer tick, an
+    /// auto-advance, or a timed UI state. Render results and document loads wake the UI themselves.
+    fn next_repaint_delay(&self) -> Duration {
+        let now = Instant::now();
+        let wall_clock_into_second =
+            Duration::from_nanos(u64::from(Local::now().timestamp_subsec_nanos()));
+        let mut delay = [
+            wall_clock_into_second,
+            self.state.talk_elapsed(now),
+            self.state.current_slide_elapsed(now),
+        ]
+        .into_iter()
+        .map(Self::time_until_next_second)
+        .fold(Duration::from_secs(1), Duration::min);
+        if let Some(remaining) = self.state.auto_advance_remaining(now) {
+            delay = delay.min(remaining);
+        }
+        for deadline in [
+            self.unsaved_toast_until,
+            self.non_critical_texture_refresh_after,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            delay = delay.min(deadline.saturating_duration_since(now));
+        }
+        delay
+    }
+
+    fn time_until_next_second(elapsed: Duration) -> Duration {
+        Duration::from_nanos(u64::from(
+            1_000_000_000u32.saturating_sub(elapsed.subsec_nanos()),
+        ))
     }
 
     fn format_duration(duration: Duration) -> String {
@@ -4556,17 +4629,16 @@ impl PresenterApp {
         let labels: Vec<String> = (0..durations.len())
             .map(|index| self.state.label_at(index).unwrap_or("").to_owned())
             .collect();
-        let section_paths = self.document.as_ref().map(|document| {
-            (0..durations.len())
-                .map(|index| document.outline_path_for_page(index))
-                .collect::<Vec<_>>()
-        });
+        let section_paths = self
+            .document
+            .is_some()
+            .then_some(self.outline_paths_by_page.as_slice());
 
         Self::build_timing_breakdown_model(
             &durations,
             &labels,
             self.state.current_index(),
-            section_paths.as_deref(),
+            section_paths,
         )
     }
 
@@ -4802,12 +4874,18 @@ impl PresenterApp {
                                             );
                                         let thumbnail_visible = ui.is_rect_visible(thumbnail_rect);
                                         let texture = thumbnail_visible.then(|| {
-                                            let thumbnail_layout =
-                                                self.resolve_layout_for_slide(index);
-                                            self.get_or_render_overview_texture(
+                                            match self.resolve_layout_for_slide(
                                                 index,
-                                                thumbnail_layout,
-                                            )
+                                                RenderPriority::Low,
+                                            ) {
+                                                LayoutResolution::Resolved(thumbnail_layout) => {
+                                                    self.get_or_render_overview_texture(
+                                                        index,
+                                                        thumbnail_layout,
+                                                    )
+                                                }
+                                                LayoutResolution::Pending => None,
+                                            }
                                         });
                                         if let Some(texture) = texture.flatten() {
                                             let image_size = Self::fit_size(
@@ -5074,7 +5152,7 @@ impl PresenterApp {
         } else {
             self.state.current_index()
         };
-        let displayed_layout = self.resolve_layout_for_slide(displayed_index);
+        let displayed_layout = self.layout_for_display(displayed_index);
         let surface_space = if self.state.screen_roles_swapped {
             SlideSurfaceSpace::FullPage
         } else {
@@ -5218,7 +5296,7 @@ impl PresenterApp {
         let slide_elapsed = Self::format_duration(self.state.current_slide_elapsed(Instant::now()));
         let wall_clock = Local::now().format("%H:%M:%S").to_string();
         let display_index = self.presenter_display_index();
-        let display_layout = self.resolve_layout_for_slide(display_index);
+        let display_layout = self.layout_for_display(display_index);
         let interaction_mode = self.interaction_mode();
         let current_override_secs = self.state.auto_advance_slide_override_secs(display_index);
         let effective_interval_secs = self
@@ -6314,32 +6392,32 @@ impl eframe::App for PresenterApp {
                 }
             }
         }
+        self.poll_document_load();
         self.handle_shortcuts(&ctx);
         self.apply_overview_commit();
         self.refresh_document_if_changed();
         self.run_auto_advance_tick();
         self.apply_background_render_results(&ctx);
-        self.refresh_textures(&ctx);
+        self.refresh_textures();
 
         let root_title = if self.state.screen_roles_swapped {
             "PDF Presenter - Projector (Swapped)"
         } else {
             "PDF Presenter - Presenter"
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(root_title.to_owned()));
+        if self.last_root_title != Some(root_title) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(root_title.to_owned()));
+            self.last_root_title = Some(root_title);
+        }
 
         self.render_presenter_view(ui, &ctx);
         self.render_projector_view(&ctx);
         self.render_unsaved_changes_dialog(&ctx);
         self.render_unsaved_toast(&ctx);
         self.finish_laser_frame(&ctx);
-        let repaint_delay = if self.render_worker.has_pending_work() {
-            Duration::from_millis(16)
-        } else {
-            Duration::from_millis(100)
-        };
-        ctx.request_repaint_of(self.projector_viewport);
-        ctx.request_repaint_after(repaint_delay);
+        // The projector is an immediate viewport, so it is redrawn with every root frame; asking
+        // for its repaint here would make eframe repaint the root again and never go idle.
+        ctx.request_repaint_after(self.next_repaint_delay());
     }
 }
 
@@ -6601,6 +6679,18 @@ mod overview_tests {
         let max_pan_y = ((scaled.y - 450.0) * 0.5).max(0.0);
         assert!(zoom_pan.pan.x.abs() <= max_pan_x + 0.001);
         assert!(zoom_pan.pan.y.abs() <= max_pan_y + 0.001);
+    }
+
+    #[test]
+    fn repaint_waits_until_the_next_whole_second() {
+        assert_eq!(
+            PresenterApp::time_until_next_second(Duration::from_millis(12_250)),
+            Duration::from_millis(750)
+        );
+        assert_eq!(
+            PresenterApp::time_until_next_second(Duration::from_secs(3)),
+            Duration::from_secs(1)
+        );
     }
 
     #[test]

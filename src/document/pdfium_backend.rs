@@ -1,5 +1,5 @@
 use super::pdfium_renderer::render_page_bitmap_from_path;
-use super::pdfium_runtime::with_pdfium;
+use super::pdfium_runtime::with_pdfium_document;
 use crate::config::{NotesLayout, NotesMode, NotesSide, SplitAxis};
 use crate::document::{
     DocumentBackend, NewInkAnnotation, NewTextAnnotation, NotesDetectionResult, PageBitmap,
@@ -24,10 +24,7 @@ impl PdfiumFallbackBackend {
             bail!("document not found: {}", path.display());
         }
 
-        let page_count = with_pdfium(|pdfium| {
-            let document = pdfium
-                .load_pdf_from_file(path, None)
-                .with_context(|| format!("failed to load PDF with PDFium: {}", path.display()))?;
+        let page_count = with_pdfium_document(path, |document| {
             let page_count = document.pages().len() as usize;
             if page_count == 0 {
                 bail!("document has no pages: {}", path.display());
@@ -143,6 +140,14 @@ impl DocumentBackend for PdfiumFallbackBackend {
         Ok(Self::detect_layout_from_mode(mode))
     }
 
+    fn detect_notes_layout_without_render(
+        &self,
+        index: usize,
+        mode: NotesMode,
+    ) -> Option<Result<NotesDetectionResult>> {
+        Some(self.detect_notes_layout(index, mode))
+    }
+
     fn render_page_bitmap(
         &self,
         index: usize,
@@ -154,12 +159,7 @@ impl DocumentBackend for PdfiumFallbackBackend {
     }
 
     fn page_geometry(&self, index: usize) -> Result<PageGeometry> {
-        with_pdfium(|pdfium| {
-            let document = pdfium
-                .load_pdf_from_file(&self.path, None)
-                .with_context(|| {
-                    format!("failed to load PDF with PDFium: {}", self.path.display())
-                })?;
+        with_pdfium_document(&self.path, |document| {
             let page = document.pages().get(self.check_index(index)?)?;
 
             Ok(PageGeometry {
@@ -209,23 +209,13 @@ impl DocumentBackend for PdfiumFallbackBackend {
         bail!("{READ_ONLY_MESSAGE}");
     }
 
-    fn reload_if_changed(&mut self) -> Result<bool> {
+    fn has_changed_on_disk(&self) -> Result<bool> {
         let metadata = std::fs::metadata(&self.path)
             .with_context(|| format!("failed to read metadata for {}", self.path.display()))?;
-        let modified = metadata.modified().ok();
-        let changed = match (self.modified_at, modified) {
+        Ok(match (self.modified_at, metadata.modified().ok()) {
             (Some(previous), Some(current)) => current > previous,
             (None, Some(_)) => true,
             _ => false,
-        };
-
-        if !changed {
-            return Ok(false);
-        }
-
-        let reloaded = Self::open(&self.path)?;
-        self.page_count = reloaded.page_count;
-        self.modified_at = reloaded.modified_at;
-        Ok(true)
+        })
     }
 }

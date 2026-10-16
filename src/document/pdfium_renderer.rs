@@ -1,4 +1,4 @@
-use super::pdfium_runtime::with_pdfium;
+use super::pdfium_runtime::with_pdfium_document;
 use crate::config::{NotesLayout, NotesSide, SplitAxis};
 use crate::document::{PageBitmap, PageView};
 use anyhow::{Context, Result, bail};
@@ -199,10 +199,7 @@ pub(crate) fn render_page_bitmap_from_path(
     layout: Option<NotesLayout>,
     target_width: usize,
 ) -> Result<PageBitmap> {
-    with_pdfium(|pdfium| {
-        let document = pdfium
-            .load_pdf_from_file(path, None)
-            .with_context(|| format!("failed to load PDF with PDFium: {}", path.display()))?;
+    with_pdfium_document(path, |document| {
         let page_index: i32 = index
             .try_into()
             .map_err(|_| anyhow::anyhow!("page index out of range for PDFium: {index}"))?;
