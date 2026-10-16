@@ -29,11 +29,11 @@ jobs:
             name: windows-x86_64
             format: nsis
             artifact_glob: dist/*.exe
-          - os: macos-15-intel
+          - os: macos-26-intel
             name: macos-x86_64
             format: dmg
             artifact_glob: dist/*.dmg
-          - os: macos-15
+          - os: macos-26
             name: macos-aarch64
             format: dmg
             artifact_glob: dist/*.dmg
