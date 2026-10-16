@@ -1,14 +1,13 @@
-mod lopdf_backend;
+mod layout_detection;
 mod pdfium_backend;
 mod pdfium_renderer;
 mod pdfium_runtime;
 
 use crate::cache::CacheWeight;
 use crate::config::{NotesLayout, NotesMode};
-use anyhow::{Context, Result};
-pub use lopdf_backend::LopdfBackend;
-pub(crate) use lopdf_backend::detect_notes_layout_from_path;
-pub use pdfium_backend::PdfiumFallbackBackend;
+use anyhow::Result;
+pub(crate) use layout_detection::detect_notes_layout_from_path;
+pub use pdfium_backend::PdfiumBackend;
 pub(crate) use pdfium_renderer::render_page_bitmap_from_path;
 use std::path::Path;
 
@@ -196,7 +195,8 @@ pub trait DocumentBackend: Send {
         target_width: usize,
     ) -> Result<PageBitmap>;
     fn page_geometry(&self, index: usize) -> Result<PageGeometry>;
-    fn list_text_annotations(&self, index: usize) -> Result<Vec<TextAnnotation>>;
+    /// Takes `&mut self` because listing assigns ids to annotations seen for the first time.
+    fn list_text_annotations(&mut self, index: usize) -> Result<Vec<TextAnnotation>>;
     fn add_text_annotation(
         &mut self,
         index: usize,
@@ -216,16 +216,7 @@ pub trait DocumentBackend: Send {
 }
 
 pub fn open_document(path: impl AsRef<Path>) -> Result<Box<dyn DocumentBackend>> {
-    let path = path.as_ref();
-    match LopdfBackend::open(path) {
-        Ok(backend) => Ok(Box::new(backend)),
-        Err(lopdf_error) => {
-            let backend = PdfiumFallbackBackend::open(path).with_context(|| {
-                format!("failed to open with both lopdf and PDFium (lopdf error: {lopdf_error})")
-            })?;
-            Ok(Box::new(backend))
-        }
-    }
+    Ok(Box::new(PdfiumBackend::open(path.as_ref())?))
 }
 
 #[cfg(test)]
@@ -265,21 +256,18 @@ mod tests {
     }
 
     #[test]
-    fn open_document_falls_back_to_pdfium_for_non_lopdf_fixture_when_present() {
+    fn open_document_renders_the_secondary_fixture_when_present() {
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("978-4-431-55978-8.pdf");
         if !fixture.exists() {
             return;
         }
 
-        let backend = open_document(&fixture).expect("fixture should open via fallback");
-        assert!(
-            backend.page_count() > 1,
-            "fallback backend should expose page count"
-        );
+        let backend = open_document(&fixture).expect("fixture should open");
+        assert!(backend.page_count() > 1, "backend should expose page count");
 
         let rendered = backend
             .render_page_bitmap(0, PageView::Full, None::<NotesLayout>, 1000)
-            .expect("fallback backend should render first page");
+            .expect("backend should render first page");
         assert!(rendered.width > 0);
         assert!(rendered.height > 0);
     }

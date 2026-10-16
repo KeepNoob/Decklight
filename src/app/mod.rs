@@ -1380,7 +1380,7 @@ impl PresenterApp {
             return;
         }
 
-        let Some(document) = self.document.as_ref() else {
+        let Some(document) = self.document.as_mut() else {
             self.text_annotations.clear();
             self.original_text_annotations.clear();
             self.text_annotation_cache_index = None;

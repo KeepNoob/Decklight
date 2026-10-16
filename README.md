@@ -143,10 +143,15 @@ Useful config groups:
 
 ## Backend Behavior and Limitations
 
-- Loader path:
-  1. `lopdf` backend (full annotation read/write)
-  2. PDFium fallback if `lopdf` parse fails
-- PDFium fallback is render-first and currently read-only for annotation writes/saves.
+- PDFium handles rendering and annotation read/write for every PDF, including files whose
+  cross-reference table PDFium has to repair.
+- Pen strokes are saved as ink annotations with their own appearance, so other viewers draw
+  them the same way.
+- Saves write a temporary copy next to the PDF and then replace the original. If the
+  original cannot be replaced, the edits stay open from the temporary copy until a later save
+  succeeds.
+- The status and priority of annotations made by other tools are read only from Decklight's own
+  metadata block, not from the PDF `Subj` field.
 - Some malformed PDFs may still render as blank in all engines; repair externally (`qpdf`, Acrobat/Chrome re-save) and reopen.
 
 ## Development Commands

@@ -128,7 +128,7 @@ pub(super) fn bind_pdfium() -> anyhow::Result<Pdfium> {
     }
 }
 
-struct CachedPdfiumDocument {
+pub(super) struct CachedPdfiumDocument {
     path: PathBuf,
     modified_at: Option<SystemTime>,
     length: u64,
@@ -162,6 +162,42 @@ fn lock_pdfium_ffi() -> MutexGuard<'static, Option<CachedPdfiumDocument>> {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
+}
+
+/// Exclusive access to PDFium. PDFium is not thread-safe, so every call into it, including
+/// closing a document, happens while a session is alive.
+pub(super) struct PdfiumSession<'guard> {
+    pdfium: &'static Pdfium,
+    cached_document: &'guard mut Option<CachedPdfiumDocument>,
+}
+
+impl PdfiumSession<'_> {
+    pub(super) fn pdfium(&self) -> &'static Pdfium {
+        self.pdfium
+    }
+
+    /// Closes the render cache's document so its file handle is released before the file is
+    /// replaced.
+    pub(super) fn release_render_document(&mut self) {
+        *self.cached_document = None;
+    }
+}
+
+pub(super) fn with_pdfium<T>(
+    operation: impl FnOnce(&mut PdfiumSession<'_>) -> Result<T>,
+) -> Result<T> {
+    let mut cached_document = lock_pdfium_ffi();
+    let pdfium = pdfium_instance()?;
+    operation(&mut PdfiumSession {
+        pdfium,
+        cached_document: &mut cached_document,
+    })
+}
+
+/// Closes `document` while holding the PDFium lock.
+pub(super) fn close_pdfium_document(document: PdfDocument<'static>) {
+    let _guard = lock_pdfium_ffi();
+    drop(document);
 }
 
 /// Runs `operation` against the PDFium document for `path`.
@@ -198,11 +234,6 @@ pub(super) fn with_pdfium_document<T>(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("PDFium document cache was empty after loading"))?;
     operation(&cached.document)
-}
-
-/// Closes the cached PDFium document so its file handle is released before the file is rewritten.
-pub(crate) fn release_cached_pdfium_document() {
-    *lock_pdfium_ffi() = None;
 }
 
 fn platform_info(os: &str, arch: &str) -> Result<&'static PlatformInfo> {
