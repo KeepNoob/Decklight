@@ -231,7 +231,6 @@ impl PresenterApp {
             settings_open: false,
             settings_tab: SettingsTab::General,
             slides_column_fraction,
-            notes_area_rect: Rect::NOTHING,
             shortcut_bindings,
             keybinding_editor,
             keybinding_editor_dirty: false,
@@ -3119,73 +3118,85 @@ impl PresenterApp {
         );
     }
 
-    fn render_pen_toolkit_controls(&mut self, ui: &mut egui::Ui, compact: bool, index: usize) {
+    /// Renders the pen controls. `inline` lays every group out in the caller's row, for the
+    /// annotation tool strip; otherwise each group gets its own wrapped row.
+    fn render_pen_toolkit_controls(&mut self, ui: &mut egui::Ui, inline: bool, index: usize) {
+        let palette = self.palette();
         let presets = self.config.pen_toolkit.presets.clone();
         let active_index = self.config.pen_toolkit.active_preset_index;
         let draw_selected = self.active_highlight_tool == HighlightTool::Draw;
         let lasso_selected = self.active_highlight_tool == HighlightTool::Lasso;
         let eraser_selected = self.active_highlight_tool == HighlightTool::Eraser;
 
-        ui.horizontal_wrapped(|ui| {
-            if !compact {
+        Self::toolkit_group(ui, inline, |ui| {
+            if !inline {
                 ui.label("Tool:");
             }
             if ui
-                .selectable_label(draw_selected, if compact { "Draw" } else { "Draw (H)" })
+                .add(toggle_button(draw_selected, "Draw"))
+                .on_hover_text(self.shortcut_hint("Draw", ShortcutAction::ToggleHighlight))
                 .clicked()
             {
                 self.set_highlight_tool(HighlightTool::Draw);
             }
             if ui
-                .selectable_label(lasso_selected, if compact { "Lasso" } else { "Lasso (M)" })
+                .add(toggle_button(lasso_selected, "Lasso"))
+                .on_hover_text(
+                    self.shortcut_hint("Lasso select", ShortcutAction::ToggleLassoSelect),
+                )
                 .clicked()
             {
                 self.toggle_lasso_mode();
             }
             if ui
-                .selectable_label(
-                    eraser_selected,
-                    if compact { "Eraser" } else { "Eraser (E)" },
-                )
+                .add(toggle_button(eraser_selected, "Eraser"))
+                .on_hover_text(self.shortcut_hint("Eraser", ShortcutAction::ToggleEraser))
                 .clicked()
             {
                 self.toggle_eraser_mode();
             }
         });
+        if inline {
+            toolbar_divider(ui, palette);
+        }
 
-        ui.horizontal_wrapped(|ui| {
-            if !compact {
+        Self::toolkit_group(ui, inline, |ui| {
+            if !inline {
                 ui.label("Pen:");
             }
             for (preset_index, preset) in presets.iter().enumerate() {
                 let selected = preset_index == active_index;
-                let button_text = if compact {
-                    format!(
-                        "{}{}",
-                        preset_index + 1,
-                        preset.name.chars().next().unwrap_or('P')
-                    )
-                } else {
-                    preset.name.clone()
-                };
-                if ui.selectable_label(selected, button_text).clicked() {
+                if ui
+                    .add(toggle_button(selected, preset.name.as_str()))
+                    .on_hover_text(format!(
+                        "{}\n{}",
+                        self.shortcut_hint(
+                            "Previous pen preset",
+                            ShortcutAction::PreviousPenPreset
+                        ),
+                        self.shortcut_hint("Next pen preset", ShortcutAction::NextPenPreset)
+                    ))
+                    .clicked()
+                {
                     self.set_active_pen_preset(preset_index);
                 }
             }
         });
 
         let mut preset = self.active_pen_preset();
-        let style_color = Self::color32_from_rgb_opacity(preset.color_rgb, preset.opacity);
-        ui.horizontal(|ui| {
-            ui.colored_label(style_color, "Sample");
-            ui.label(format!(
-                "{}  w:{:.1}  op:{:.2}",
-                preset.name, preset.width, preset.opacity
-            ));
-            if !self.selected_stroke_ids.is_empty() {
-                ui.label(format!("selected: {}", self.selected_stroke_ids.len()));
-            }
-        });
+        if !inline {
+            let style_color = Self::color32_from_rgb_opacity(preset.color_rgb, preset.opacity);
+            ui.horizontal(|ui| {
+                ui.colored_label(style_color, "Sample");
+                ui.label(format!(
+                    "{}  w:{:.1}  op:{:.2}",
+                    preset.name, preset.width, preset.opacity
+                ));
+                if !self.selected_stroke_ids.is_empty() {
+                    ui.label(format!("selected: {}", self.selected_stroke_ids.len()));
+                }
+            });
+        }
 
         let color_swatches: [(&str, (f32, f32, f32)); 8] = [
             ("Yellow", (1.0, 0.92, 0.15)),
@@ -3197,23 +3208,28 @@ impl PresenterApp {
             ("White", (0.96, 0.96, 0.96)),
             ("Black", (0.10, 0.10, 0.10)),
         ];
-        ui.horizontal_wrapped(|ui| {
-            ui.label(if compact { "Clr:" } else { "Color:" });
+        if inline {
+            toolbar_divider(ui, palette);
+        }
+        Self::toolkit_group(ui, inline, |ui| {
+            if !inline {
+                ui.label("Color:");
+            }
             for (name, rgb) in color_swatches {
                 let selected = (preset.color_rgb.0 - rgb.0).abs() < 0.01
                     && (preset.color_rgb.1 - rgb.1).abs() < 0.01
                     && (preset.color_rgb.2 - rgb.2).abs() < 0.01;
                 let stroke = if selected {
-                    Stroke::new(2.0, Color32::WHITE)
+                    Stroke::new(2.5, palette.accent)
                 } else {
-                    Stroke::new(1.0, Color32::from_gray(30))
+                    Stroke::new(1.0, palette.panel_stroke)
                 };
                 let response = ui
                     .add(
                         egui::Button::new("")
                             .fill(Self::color32_from_rgb_opacity(rgb, 1.0))
                             .stroke(stroke)
-                            .min_size(Vec2::new(16.0, 16.0)),
+                            .min_size(Vec2::new(20.0, 20.0)),
                     )
                     .on_hover_text(name);
                 if response.clicked() {
@@ -3223,7 +3239,10 @@ impl PresenterApp {
             }
 
             let mut rgb = [preset.color_rgb.0, preset.color_rgb.1, preset.color_rgb.2];
-            if egui::color_picker::color_edit_button_rgb(ui, &mut rgb).changed() {
+            if egui::color_picker::color_edit_button_rgb(ui, &mut rgb)
+                .on_hover_text("Custom color")
+                .changed()
+            {
                 self.update_active_pen_preset_style(Some((rgb[0], rgb[1], rgb[2])), None);
                 preset = self.active_pen_preset();
             }
@@ -3231,72 +3250,82 @@ impl PresenterApp {
 
         let quick_widths = [2.0_f32, 4.0_f32, 6.0_f32];
         let mut width = preset.width;
-        ui.horizontal_wrapped(|ui| {
-            ui.label(if compact { "W:" } else { "Thickness:" });
+        if inline {
+            toolbar_divider(ui, palette);
+        }
+        Self::toolkit_group(ui, inline, |ui| {
+            if !inline {
+                ui.label("Thickness:");
+            }
             for quick in quick_widths {
                 let selected = (width - quick).abs() < 0.05;
                 if ui
-                    .selectable_label(
-                        selected,
-                        if compact {
-                            format!("{quick:.0}")
-                        } else {
-                            format!("{quick:.0}px")
-                        },
-                    )
+                    .add(toggle_button(selected, format!("{quick:.0}px")))
                     .clicked()
                 {
                     width = quick;
                     self.update_active_pen_preset_style(None, Some(width));
                 }
             }
-            let slider = egui::Slider::new(&mut width, 0.5..=24.0).text(if compact {
-                "w"
-            } else {
-                "Stroke"
-            });
+            if inline {
+                ui.spacing_mut().slider_width = 110.0;
+            }
+            let slider = egui::Slider::new(&mut width, 0.5..=24.0)
+                .text(if inline { "" } else { "Stroke" })
+                .suffix(if inline { " px" } else { "" });
             if ui.add(slider).changed() {
                 self.update_active_pen_preset_style(None, Some(width));
             }
         });
 
         if !self.selected_stroke_ids.is_empty() {
-            ui.horizontal_wrapped(|ui| {
+            if inline {
+                toolbar_divider(ui, palette);
+                quiet_label(
+                    ui,
+                    palette,
+                    format!("{} selected", self.selected_stroke_ids.len()),
+                );
+            }
+            Self::toolkit_group(ui, inline, |ui| {
                 if ui
-                    .button(if compact {
-                        "Preset->Sel"
-                    } else {
-                        "Apply Preset (K)"
-                    })
+                    .button("Apply Preset")
+                    .on_hover_text(self.shortcut_hint(
+                        "Apply the active preset to the selected strokes",
+                        ShortcutAction::ApplyPresetToSelectedStrokes,
+                    ))
                     .clicked()
                 {
                     self.apply_active_preset_to_selected_strokes(index);
                 }
                 if ui
-                    .button(if compact {
-                        "Delete Sel"
-                    } else {
-                        "Delete Selected (Del)"
-                    })
+                    .button("Delete Selected")
+                    .on_hover_text(self.shortcut_hint(
+                        "Delete the selected strokes",
+                        ShortcutAction::DeleteSelectedStrokes,
+                    ))
                     .clicked()
                 {
                     self.delete_selected_strokes(index);
                 }
-                if ui
-                    .button(if compact {
-                        "Clear Sel"
-                    } else {
-                        "Clear Selection"
-                    })
-                    .clicked()
-                {
+                if ui.button("Clear Selection").clicked() {
                     self.clear_selected_strokes_selection();
                 }
             });
         }
     }
 
-    fn render_quick_actions_overlay(&mut self, ui: &mut egui::Ui, image_rect: Rect, index: usize) {
+    fn toolkit_group(ui: &mut egui::Ui, inline: bool, add_contents: impl FnOnce(&mut egui::Ui)) {
+        if inline {
+            add_contents(ui);
+        } else {
+            ui.horizontal_wrapped(add_contents);
+        }
+    }
+
+    /// Contextual second toolbar row shown only while highlighting or editing PDF notes, so the
+    /// tools never float over the slides or notes.
+    fn render_annotation_tool_strip(&mut self, ui: &mut egui::Ui, index: usize) {
         let mode = self.interaction_mode();
         if mode == InteractionMode::Navigate {
             return;
@@ -3311,86 +3340,60 @@ impl PresenterApp {
             .get(&index)
             .is_some_and(|entries| !entries.is_empty());
         let has_current_stroke = !self.stroke_in_progress.is_empty();
-        let selected_exists = self.selected_annotation().is_some();
+        let note_actions_enabled = self.selected_annotation().is_some();
         let transform_dirty = self.selected_transform_dirty();
-        let note_actions_enabled = mode == InteractionMode::AnnotationEdit && selected_exists;
-        let can_save = self.has_unsaved_annotation_changes();
 
         let palette = self.palette();
-        let overlay_id = egui::Id::unique("quick_actions_overlay");
-        let anchor_rect = self.notes_area_rect;
-        let overlay_width = (image_rect.width() - 20.0)
-            .min(anchor_rect.width() - 32.0)
-            .clamp(220.0, 560.0);
-        egui::Area::new(overlay_id)
-            .order(egui::Order::Foreground)
-            .pivot(Align2::LEFT_BOTTOM)
-            .fixed_pos(anchor_rect.left_bottom() + Vec2::new(16.0, -16.0))
-            .show(ui.ctx(), |ui| {
-                ui.set_width(overlay_width);
-                ui.set_max_width(overlay_width);
-                let fill = palette.panel_elevated;
-                let frame = egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(
-                        fill.r(),
-                        fill.g(),
-                        fill.b(),
-                        238,
-                    ))
+        egui::Panel::top("annotation_tools")
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.panel_elevated)
                     .stroke(Stroke::new(1.0, palette.panel_stroke))
-                    .corner_radius(12.0)
-                    .inner_margin(egui::Margin::same(10));
-                frame.show(ui, |ui| {
-                    self.render_pen_toolkit_controls(ui, true, index);
-                    ui.separator();
-                    ui.horizontal_wrapped(|ui| {
-                        if ui
-                            .add_enabled(has_unsaved_strokes, egui::Button::new("Undo"))
-                            .clicked()
-                        {
-                            self.undo_last_stroke(index);
-                        }
-                        if ui
-                            .add_enabled(has_redo, egui::Button::new("Redo"))
-                            .clicked()
-                        {
-                            self.redo_last_stroke(index);
-                        }
-                        if ui
-                            .add_enabled(has_current_stroke, egui::Button::new("Clear Current"))
-                            .clicked()
-                        {
-                            self.clear_current_stroke();
-                        }
-                        if ui
-                            .add_enabled(has_unsaved_strokes, egui::Button::new("Clear Slide"))
-                            .clicked()
-                        {
-                            self.clear_slide_highlights(index);
-                        }
-                        if ui
-                            .add_enabled(can_save, egui::Button::new("Save Now"))
-                            .clicked()
-                        {
-                            self.save_document_in_place();
-                        }
+                    .inner_margin(egui::Margin::symmetric(12, 6)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.label(section_header_text(
+                        palette,
+                        if mode == InteractionMode::HighlightDraw {
+                            "Highlight"
+                        } else {
+                            "Edit notes"
+                        },
+                    ));
+                    toolbar_divider(ui, palette);
+
+                    if mode == InteractionMode::HighlightDraw {
+                        self.render_pen_toolkit_controls(ui, true, index);
+                        toolbar_divider(ui, palette);
+                    } else {
                         if ui
                             .add_enabled(note_actions_enabled, egui::Button::new("Duplicate"))
+                            .on_hover_text(self.shortcut_hint(
+                                "Duplicate the selected note",
+                                ShortcutAction::DuplicateSelectedNote,
+                            ))
                             .clicked()
                         {
                             self.duplicate_selected_note(index);
                         }
                         if ui
                             .add_enabled(note_actions_enabled, egui::Button::new("Delete"))
+                            .on_hover_text(self.shortcut_hint(
+                                "Delete the selected note",
+                                ShortcutAction::DeleteSelectedNote,
+                            ))
                             .clicked()
                         {
                             self.delete_selected_note(index);
                         }
                         if ui
-                            .add_enabled(
-                                mode == InteractionMode::AnnotationEdit && transform_dirty,
-                                egui::Button::new("Apply"),
-                            )
+                            .add_enabled(transform_dirty, egui::Button::new("Apply"))
+                            .on_hover_text(self.shortcut_hint(
+                                "Apply the moved or resized note",
+                                ShortcutAction::ApplyTransform,
+                            ))
                             .clicked()
                         {
                             self.commit_selected_annotation_update(
@@ -3398,15 +3401,56 @@ impl PresenterApp {
                             );
                         }
                         if ui
-                            .add_enabled(
-                                mode == InteractionMode::AnnotationEdit && transform_dirty,
-                                egui::Button::new("Revert"),
-                            )
+                            .add_enabled(transform_dirty, egui::Button::new("Revert"))
+                            .on_hover_text(self.shortcut_hint(
+                                "Revert the moved or resized note",
+                                ShortcutAction::RevertTransform,
+                            ))
                             .clicked()
                         {
                             self.revert_selected_transform();
                         }
-                    });
+                        toolbar_divider(ui, palette);
+                    }
+
+                    if ui
+                        .add_enabled(has_unsaved_strokes, egui::Button::new("↶ Undo"))
+                        .on_hover_text(
+                            self.shortcut_hint("Undo stroke", ShortcutAction::UndoStroke),
+                        )
+                        .clicked()
+                    {
+                        self.undo_last_stroke(index);
+                    }
+                    if ui
+                        .add_enabled(has_redo, egui::Button::new("↷ Redo"))
+                        .on_hover_text(
+                            self.shortcut_hint("Redo stroke", ShortcutAction::RedoStroke),
+                        )
+                        .clicked()
+                    {
+                        self.redo_last_stroke(index);
+                    }
+                    if ui
+                        .add_enabled(has_current_stroke, egui::Button::new("Clear Current"))
+                        .on_hover_text(self.shortcut_hint(
+                            "Clear the stroke in progress",
+                            ShortcutAction::ClearCurrentStroke,
+                        ))
+                        .clicked()
+                    {
+                        self.clear_current_stroke();
+                    }
+                    if ui
+                        .add_enabled(has_unsaved_strokes, egui::Button::new("Clear Slide"))
+                        .on_hover_text(self.shortcut_hint(
+                            "Clear unsaved highlights on this slide",
+                            ShortcutAction::ClearSlideHighlights,
+                        ))
+                        .clicked()
+                    {
+                        self.clear_slide_highlights(index);
+                    }
                 });
             });
     }
@@ -5343,6 +5387,7 @@ impl PresenterApp {
         let palette = self.palette();
 
         self.render_presenter_toolbar(ui, ctx, display_index);
+        self.render_annotation_tool_strip(ui, display_index);
         self.render_status_bar(ui, &talk_elapsed, &slide_elapsed, &wall_clock);
 
         egui::CentralPanel::default()
@@ -5403,7 +5448,6 @@ impl PresenterApp {
                     Stroke::new(3.0, grip_color),
                 );
 
-                self.notes_area_rect = notes_rect;
                 ui.scope_builder(egui::UiBuilder::new().max_rect(notes_rect), |ui| {
                     self.render_notes_card(ui);
                 });
@@ -5868,7 +5912,6 @@ impl PresenterApp {
                             display_index,
                             display_layout,
                         );
-                        self.render_quick_actions_overlay(ui, image_rect, display_index);
                         self.draw_unsaved_badge_on_preview(ui, image_rect);
                         Self::draw_laser_overlay(
                             ui,

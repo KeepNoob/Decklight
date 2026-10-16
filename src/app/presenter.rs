@@ -12,7 +12,7 @@ use super::timing::TimingBreakdownState;
 use crate::cache::PageCache;
 use crate::config::{AppConfig, NotesLayout, NotesLayoutOverrideConfig};
 use crate::document::{DocumentBackend, TextAnnotation};
-use eframe::egui::{Context, Rect, TextureHandle, ViewportId};
+use eframe::egui::{Context, TextureHandle, ViewportId};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -130,8 +130,6 @@ pub(super) struct PresenterApp {
     pub(super) settings_open: bool,
     pub(super) settings_tab: SettingsTab,
     pub(super) slides_column_fraction: f32,
-    /// Where the floating pen/edit actions panel is anchored, so it never covers the timers.
-    pub(super) notes_area_rect: Rect,
     pub(super) shortcut_bindings: ShortcutBindings,
     pub(super) keybinding_editor: BTreeMap<String, String>,
     pub(super) keybinding_editor_dirty: bool,
