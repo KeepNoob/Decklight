@@ -46,6 +46,139 @@ struct RegionStats {
     dark_density: f32,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct LumaTotals {
+    luma_sum: f64,
+    ink: usize,
+    dark: usize,
+}
+
+impl LumaTotals {
+    fn add_pixel(&mut self, luma: f32) {
+        self.luma_sum += f64::from(luma);
+        if luma < 220.0 {
+            self.ink += 1;
+        }
+        if luma < 120.0 {
+            self.dark += 1;
+        }
+    }
+
+    fn add(&mut self, other: LumaTotals) {
+        self.luma_sum += other.luma_sum;
+        self.ink += other.ink;
+        self.dark += other.dark;
+    }
+}
+
+/// Luma of every pixel plus per-column and per-row totals, computed in one pass so each split
+/// candidate sums a few totals instead of rescanning the whole bitmap.
+struct LumaProfile {
+    width: usize,
+    height: usize,
+    luma: Vec<f32>,
+    columns: Vec<LumaTotals>,
+    rows: Vec<LumaTotals>,
+}
+
+impl LumaProfile {
+    fn from_bitmap(bitmap: &PageBitmap) -> Option<Self> {
+        let width = bitmap.width;
+        let height = bitmap.height;
+        let pixel_count = width.checked_mul(height)?;
+        if width == 0 || height == 0 || bitmap.rgba.len() < pixel_count.checked_mul(4)? {
+            return None;
+        }
+
+        let luma: Vec<f32> = bitmap
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .take(pixel_count)
+            .map(|pixel| {
+                0.2126 * f32::from(pixel[0])
+                    + 0.7152 * f32::from(pixel[1])
+                    + 0.0722 * f32::from(pixel[2])
+            })
+            .collect();
+        let mut columns = vec![LumaTotals::default(); width];
+        let mut rows = vec![LumaTotals::default(); height];
+        for (row_totals, row) in rows.iter_mut().zip(luma.chunks_exact(width)) {
+            for (column_totals, &pixel_luma) in columns.iter_mut().zip(row) {
+                column_totals.add_pixel(pixel_luma);
+                row_totals.add_pixel(pixel_luma);
+            }
+        }
+
+        Some(Self {
+            width,
+            height,
+            luma,
+            columns,
+            rows,
+        })
+    }
+
+    /// Clamps `start..end` the same way for both axes: never empty unless `start` is at the end.
+    fn clamp_range(start: usize, end: usize, length: usize) -> (usize, usize) {
+        let clamped_start = start.min(length);
+        let clamped_end = end.min(length).max(clamped_start + 1).min(length);
+        (clamped_start, clamped_end)
+    }
+
+    fn stats(totals: &[LumaTotals], cross_length: usize) -> RegionStats {
+        let mut sum = LumaTotals::default();
+        for line in totals {
+            sum.add(*line);
+        }
+        let safe_count = (totals.len() * cross_length).max(1) as f64;
+        RegionStats {
+            mean_luma: (sum.luma_sum / safe_count) as f32,
+            ink_density: (sum.ink as f64 / safe_count) as f32,
+            dark_density: (sum.dark as f64 / safe_count) as f32,
+        }
+    }
+
+    fn column_stats(&self, from_x: usize, to_x: usize) -> RegionStats {
+        let (start, end) = Self::clamp_range(from_x, to_x, self.width);
+        Self::stats(&self.columns[start..end], self.height)
+    }
+
+    fn row_stats(&self, from_y: usize, to_y: usize) -> RegionStats {
+        let (start, end) = Self::clamp_range(from_y, to_y, self.height);
+        Self::stats(&self.rows[start..end], self.width)
+    }
+
+    fn seam_contrast_vertical(&self, split_x: usize) -> f32 {
+        if self.width < 3 || split_x == 0 || split_x >= self.width {
+            return 0.0;
+        }
+
+        let diff_sum: f32 = self
+            .luma
+            .chunks_exact(self.width)
+            .map(|row| (row[split_x - 1] - row[split_x]).abs())
+            .sum();
+        (diff_sum / self.height as f32 / 255.0).clamp(0.0, 1.0)
+    }
+
+    fn seam_contrast_horizontal(&self, split_y: usize) -> f32 {
+        if self.height < 3 || split_y == 0 || split_y >= self.height {
+            return 0.0;
+        }
+
+        let above = &self.luma[(split_y - 1) * self.width..split_y * self.width];
+        let below = &self.luma[split_y * self.width..(split_y + 1) * self.width];
+        let diff_sum: f32 = above
+            .iter()
+            .zip(below)
+            .map(|(top, bottom)| (top - bottom).abs())
+            .sum();
+        (diff_sum / self.width as f32 / 255.0).clamp(0.0, 1.0)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct OutlineEntry {
     page_index: usize,
@@ -620,94 +753,13 @@ impl LopdfBackend {
         Ok(())
     }
 
-    fn luma(r: u8, g: u8, b: u8) -> f32 {
-        0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32
-    }
-
-    fn region_stats(
-        rgba: &[u8],
-        width: usize,
-        height: usize,
-        x0: usize,
-        x1: usize,
-        y0: usize,
-        y1: usize,
-    ) -> RegionStats {
-        let clamped_x0 = x0.min(width);
-        let clamped_x1 = x1.min(width).max(clamped_x0 + 1).min(width);
-        let clamped_y0 = y0.min(height);
-        let clamped_y1 = y1.min(height).max(clamped_y0 + 1).min(height);
-
-        let mut count = 0usize;
-        let mut luma_sum = 0f32;
-        let mut ink = 0usize;
-        let mut dark = 0usize;
-
-        for y in clamped_y0..clamped_y1 {
-            for x in clamped_x0..clamped_x1 {
-                let offset = (y * width + x) * 4;
-                let lum = Self::luma(rgba[offset], rgba[offset + 1], rgba[offset + 2]);
-                luma_sum += lum;
-                if lum < 220.0 {
-                    ink += 1;
-                }
-                if lum < 120.0 {
-                    dark += 1;
-                }
-                count += 1;
-            }
-        }
-
-        let safe_count = count.max(1) as f32;
-        RegionStats {
-            mean_luma: luma_sum / safe_count,
-            ink_density: ink as f32 / safe_count,
-            dark_density: dark as f32 / safe_count,
-        }
-    }
-
-    fn seam_contrast_vertical(rgba: &[u8], width: usize, height: usize, split_x: usize) -> f32 {
-        if width < 3 || split_x == 0 || split_x >= width {
-            return 0.0;
-        }
-
-        let mut diff_sum = 0f32;
-        for y in 0..height {
-            let left = (y * width + (split_x - 1)) * 4;
-            let right = (y * width + split_x) * 4;
-            let l = Self::luma(rgba[left], rgba[left + 1], rgba[left + 2]);
-            let r = Self::luma(rgba[right], rgba[right + 1], rgba[right + 2]);
-            diff_sum += (l - r).abs();
-        }
-        (diff_sum / height.max(1) as f32 / 255.0).clamp(0.0, 1.0)
-    }
-
-    fn seam_contrast_horizontal(rgba: &[u8], width: usize, height: usize, split_y: usize) -> f32 {
-        if height < 3 || split_y == 0 || split_y >= height {
-            return 0.0;
-        }
-
-        let mut diff_sum = 0f32;
-        for x in 0..width {
-            let top = ((split_y - 1) * width + x) * 4;
-            let bottom = (split_y * width + x) * 4;
-            let t = Self::luma(rgba[top], rgba[top + 1], rgba[top + 2]);
-            let b = Self::luma(rgba[bottom], rgba[bottom + 1], rgba[bottom + 2]);
-            diff_sum += (t - b).abs();
-        }
-        (diff_sum / width.max(1) as f32 / 255.0).clamp(0.0, 1.0)
-    }
-
-    fn analyze_vertical_candidate(
-        rgba: &[u8],
-        width: usize,
-        height: usize,
-        split_ratio: f32,
-    ) -> SplitCandidate {
+    fn analyze_vertical_candidate(profile: &LumaProfile, split_ratio: f32) -> SplitCandidate {
+        let width = profile.width;
+        let height = profile.height;
         let split_x = ((width as f32) * split_ratio).round() as usize;
-        let left = Self::region_stats(rgba, width, height, 0, split_x, 0, height);
-        let right = Self::region_stats(rgba, width, height, split_x, width, 0, height);
-        let seam = Self::seam_contrast_vertical(rgba, width, height, split_x);
+        let left = profile.column_stats(0, split_x);
+        let right = profile.column_stats(split_x, width);
+        let seam = profile.seam_contrast_vertical(split_x);
         let bg_delta = ((left.mean_luma - right.mean_luma).abs() / 255.0).clamp(0.0, 1.0);
         let ink_delta = (left.ink_density - right.ink_density).abs().clamp(0.0, 1.0);
 
@@ -750,16 +802,13 @@ impl LopdfBackend {
         }
     }
 
-    fn analyze_horizontal_candidate(
-        rgba: &[u8],
-        width: usize,
-        height: usize,
-        split_ratio: f32,
-    ) -> SplitCandidate {
+    fn analyze_horizontal_candidate(profile: &LumaProfile, split_ratio: f32) -> SplitCandidate {
+        let width = profile.width;
+        let height = profile.height;
         let split_y = ((height as f32) * split_ratio).round() as usize;
-        let top = Self::region_stats(rgba, width, height, 0, width, 0, split_y);
-        let bottom = Self::region_stats(rgba, width, height, 0, width, split_y, height);
-        let seam = Self::seam_contrast_horizontal(rgba, width, height, split_y);
+        let top = profile.row_stats(0, split_y);
+        let bottom = profile.row_stats(split_y, height);
+        let seam = profile.seam_contrast_horizontal(split_y);
         let bg_delta = ((top.mean_luma - bottom.mean_luma).abs() / 255.0).clamp(0.0, 1.0);
         let ink_delta = (top.ink_density - bottom.ink_density).abs().clamp(0.0, 1.0);
 
@@ -793,8 +842,8 @@ impl LopdfBackend {
         }
     }
 
-    fn detect_layout_from_bitmap(bitmap: &PageBitmap) -> Option<SplitCandidate> {
-        if bitmap.width < 20 || bitmap.height < 20 {
+    fn detect_layout_from_profile(profile: &LumaProfile) -> Option<SplitCandidate> {
+        if profile.width < 20 || profile.height < 20 {
             return None;
         }
 
@@ -802,18 +851,12 @@ impl LopdfBackend {
         let mut best: Option<SplitCandidate> = None;
 
         for ratio in candidates {
-            let vertical =
-                Self::analyze_vertical_candidate(&bitmap.rgba, bitmap.width, bitmap.height, ratio);
+            let vertical = Self::analyze_vertical_candidate(profile, ratio);
             if best.is_none_or(|existing| vertical.confidence > existing.confidence) {
                 best = Some(vertical);
             }
 
-            let horizontal = Self::analyze_horizontal_candidate(
-                &bitmap.rgba,
-                bitmap.width,
-                bitmap.height,
-                ratio,
-            );
+            let horizontal = Self::analyze_horizontal_candidate(profile, ratio);
             if best.is_none_or(|existing| horizontal.confidence > existing.confidence) {
                 best = Some(horizontal);
             }
@@ -854,23 +897,13 @@ impl LopdfBackend {
     }
 
     fn analyze_axis_candidate(
-        bitmap: &PageBitmap,
+        profile: &LumaProfile,
         axis: SplitAxis,
         split_ratio: f32,
     ) -> SplitCandidate {
         match axis {
-            SplitAxis::Vertical => Self::analyze_vertical_candidate(
-                &bitmap.rgba,
-                bitmap.width,
-                bitmap.height,
-                split_ratio,
-            ),
-            SplitAxis::Horizontal => Self::analyze_horizontal_candidate(
-                &bitmap.rgba,
-                bitmap.width,
-                bitmap.height,
-                split_ratio,
-            ),
+            SplitAxis::Vertical => Self::analyze_vertical_candidate(profile, split_ratio),
+            SplitAxis::Horizontal => Self::analyze_horizontal_candidate(profile, split_ratio),
         }
     }
 
@@ -887,16 +920,16 @@ impl LopdfBackend {
     }
 
     fn detect_layout_with_prior(
-        bitmap: &PageBitmap,
+        profile: &LumaProfile,
         prior: ModeLayoutPrior,
     ) -> Option<SplitCandidate> {
-        if bitmap.width < 20 || bitmap.height < 20 {
+        if profile.width < 20 || profile.height < 20 {
             return None;
         }
 
         let mut best: Option<(SplitCandidate, f32)> = None;
         for split_ratio in prior.split_ratios.iter().copied() {
-            let candidate = Self::analyze_axis_candidate(bitmap, prior.axis, split_ratio);
+            let candidate = Self::analyze_axis_candidate(profile, prior.axis, split_ratio);
             let score = Self::prior_weighted_score(candidate, prior);
             if best.is_none_or(|(_, existing_score)| score > existing_score) {
                 best = Some((candidate, score));
@@ -916,8 +949,9 @@ impl LopdfBackend {
             };
         }
 
+        let profile = LumaProfile::from_bitmap(bitmap);
         if mode == NotesMode::Auto {
-            let candidate = Self::detect_layout_from_bitmap(bitmap);
+            let candidate = profile.as_ref().and_then(Self::detect_layout_from_profile);
             if let Some(candidate) = candidate {
                 let mut layout = NotesLayout {
                     axis: candidate.axis,
@@ -958,8 +992,10 @@ impl LopdfBackend {
             };
         };
 
-        let prior_candidate = Self::detect_layout_with_prior(bitmap, prior);
-        let generic_candidate = Self::detect_layout_from_bitmap(bitmap);
+        let prior_candidate = profile
+            .as_ref()
+            .and_then(|profile| Self::detect_layout_with_prior(profile, prior));
+        let generic_candidate = profile.as_ref().and_then(Self::detect_layout_from_profile);
         let chosen_candidate = match (prior_candidate, generic_candidate) {
             (Some(prior_hit), Some(generic_hit)) => {
                 let prior_score = Self::prior_weighted_score(prior_hit, prior);
@@ -1430,7 +1466,7 @@ impl DocumentBackend for LopdfBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::LopdfBackend;
+    use super::{LopdfBackend, LumaProfile};
     use crate::config::{NotesLayout, NotesMode, NotesSide, SplitAxis};
     use crate::document::{
         AnnotationMetadata, AnnotationPriority, AnnotationStatus, DocumentBackend, InkStroke,
@@ -1745,6 +1781,62 @@ mod tests {
         assert_eq!(libre_layout.axis, SplitAxis::Horizontal);
         assert_eq!(libre_layout.notes_side, NotesSide::Bottom);
         assert!(libre.warning.is_some());
+    }
+
+    #[test]
+    fn luma_profile_region_stats_match_a_direct_scan() {
+        let width = 7;
+        let height = 5;
+        let rgba: Vec<u8> = (0..width * height)
+            .flat_map(|pixel| {
+                let value = ((pixel * 37) % 256) as u8;
+                [value, value.wrapping_mul(3), 255 - value, 255]
+            })
+            .collect();
+        let bitmap = PageBitmap {
+            width,
+            height,
+            rgba: rgba.clone(),
+        };
+        let profile = LumaProfile::from_bitmap(&bitmap).expect("valid bitmap");
+        let luma_at = |x: usize, y: usize| {
+            let offset = (y * width + x) * 4;
+            0.2126 * f32::from(rgba[offset])
+                + 0.7152 * f32::from(rgba[offset + 1])
+                + 0.0722 * f32::from(rgba[offset + 2])
+        };
+
+        let mut direct_sum = 0f32;
+        let mut direct_ink = 0usize;
+        for y in 0..height {
+            for x in 2..width {
+                let luma = luma_at(x, y);
+                direct_sum += luma;
+                direct_ink += usize::from(luma < 220.0);
+            }
+        }
+        let pixel_count = ((width - 2) * height) as f32;
+        let stats = profile.column_stats(2, width);
+        assert!((stats.mean_luma - direct_sum / pixel_count).abs() < 1e-3);
+        assert!((stats.ink_density - direct_ink as f32 / pixel_count).abs() < 1e-6);
+
+        let direct_seam: f32 = (0..width)
+            .map(|x| (luma_at(x, 2) - luma_at(x, 3)).abs())
+            .sum::<f32>()
+            / width as f32
+            / 255.0;
+        assert!((profile.seam_contrast_horizontal(3) - direct_seam).abs() < 1e-6);
+        assert_eq!(profile.row_stats(height, height).mean_luma, 0.0);
+    }
+
+    #[test]
+    fn short_bitmaps_do_not_build_a_luma_profile() {
+        let bitmap = PageBitmap {
+            width: 4,
+            height: 4,
+            rgba: vec![255; 12],
+        };
+        assert!(LumaProfile::from_bitmap(&bitmap).is_none());
     }
 
     #[test]
