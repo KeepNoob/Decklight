@@ -22,9 +22,7 @@ pub(super) struct ThemePalette {
     pub(super) active_pill_text: Color32,
     pub(super) unsaved_pill: Color32,
     pub(super) unsaved_pill_text: Color32,
-    pub(super) talk_pill: Color32,
     pub(super) talk_pill_text: Color32,
-    pub(super) slide_pill: Color32,
     pub(super) slide_pill_text: Color32,
 }
 
@@ -51,9 +49,7 @@ impl ThemePalette {
                 active_pill_text: Color32::from_rgb(186, 255, 232),
                 unsaved_pill: Color32::from_rgb(86, 55, 29),
                 unsaved_pill_text: Color32::from_rgb(255, 221, 147),
-                talk_pill: Color32::from_rgb(34, 58, 76),
                 talk_pill_text: Color32::from_rgb(192, 228, 255),
-                slide_pill: Color32::from_rgb(46, 56, 40),
                 slide_pill_text: Color32::from_rgb(217, 239, 178),
             },
             AppTheme::Light => Self {
@@ -76,9 +72,7 @@ impl ThemePalette {
                 active_pill_text: Color32::from_rgb(24, 91, 78),
                 unsaved_pill: Color32::from_rgb(255, 225, 176),
                 unsaved_pill_text: Color32::from_rgb(118, 74, 19),
-                talk_pill: Color32::from_rgb(213, 231, 241),
                 talk_pill_text: Color32::from_rgb(35, 80, 107),
-                slide_pill: Color32::from_rgb(219, 235, 201),
                 slide_pill_text: Color32::from_rgb(64, 93, 43),
             },
             AppTheme::ProjectorSafe => Self {
@@ -101,9 +95,7 @@ impl ThemePalette {
                 active_pill_text: Color32::from_rgb(255, 239, 177),
                 unsaved_pill: Color32::from_rgb(86, 35, 35),
                 unsaved_pill_text: Color32::from_rgb(255, 206, 206),
-                talk_pill: Color32::from_rgb(33, 48, 65),
                 talk_pill_text: Color32::from_rgb(211, 233, 255),
-                slide_pill: Color32::from_rgb(58, 49, 23),
                 slide_pill_text: Color32::from_rgb(255, 234, 166),
             },
         }
@@ -156,16 +148,31 @@ pub(super) fn install_visual_style(ctx: &Context, theme: AppTheme) {
     visuals.widgets.open.bg_fill = palette.panel_elevated;
     visuals.widgets.open.bg_stroke = Stroke::new(1.0, palette.accent);
 
+    let widget_radius = egui::CornerRadius::same(8);
+    visuals.widgets.noninteractive.corner_radius = widget_radius;
+    visuals.widgets.inactive.corner_radius = widget_radius;
+    visuals.widgets.hovered.corner_radius = widget_radius;
+    visuals.widgets.active.corner_radius = widget_radius;
+    visuals.widgets.open.corner_radius = widget_radius;
+    visuals.window_corner_radius = egui::CornerRadius::same(12);
+    visuals.menu_corner_radius = egui::CornerRadius::same(10);
+    visuals.window_stroke = Stroke::new(1.0, palette.panel_stroke);
+
     style.visuals = visuals;
     style.spacing.item_spacing = Vec2::new(8.0, 8.0);
-    style.spacing.button_padding = Vec2::new(12.0, 7.0);
-    style.spacing.window_margin = egui::Margin::same(14);
-    style.spacing.menu_margin = egui::Margin::symmetric(10, 8);
+    style.spacing.button_padding = Vec2::new(10.0, 6.0);
+    style.spacing.interact_size = Vec2::new(36.0, 30.0);
+    style.spacing.window_margin = egui::Margin::same(16);
+    style.spacing.menu_margin = egui::Margin::symmetric(8, 8);
     style.spacing.indent = 16.0;
-    style.spacing.slider_width = 170.0;
+    style.spacing.slider_width = 180.0;
     style.text_styles.insert(
         egui::TextStyle::Heading,
-        FontId::new(21.0, FontFamily::Proportional),
+        FontId::new(20.0, FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Small,
+        FontId::new(11.5, FontFamily::Proportional),
     );
     style.text_styles.insert(
         egui::TextStyle::Body,
@@ -188,9 +195,8 @@ pub(super) fn card_frame(theme: AppTheme) -> egui::Frame {
     egui::Frame::new()
         .fill(palette.panel)
         .stroke(Stroke::new(1.0, palette.panel_stroke))
-        .corner_radius(14.0)
-        .inner_margin(egui::Margin::same(14))
-        .outer_margin(egui::Margin::same(2))
+        .corner_radius(12.0)
+        .inner_margin(egui::Margin::same(12))
 }
 
 pub(super) fn inset_frame(theme: AppTheme) -> egui::Frame {
@@ -198,8 +204,8 @@ pub(super) fn inset_frame(theme: AppTheme) -> egui::Frame {
     egui::Frame::new()
         .fill(palette.inset)
         .stroke(Stroke::new(1.0, palette.inset_stroke))
-        .corner_radius(12.0)
-        .inner_margin(egui::Margin::same(8))
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::same(6))
 }
 
 pub(super) fn section_title(
@@ -209,12 +215,7 @@ pub(super) fn section_title(
     subtitle: impl Into<Option<&'static str>>,
 ) {
     ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(title)
-                .font(FontId::new(16.0, FontFamily::Proportional))
-                .strong()
-                .color(palette.text_primary),
-        );
+        section_heading(ui, palette, title);
         if let Some(subtitle) = subtitle.into() {
             ui.label(
                 RichText::new(subtitle)
@@ -223,6 +224,38 @@ pub(super) fn section_title(
             );
         }
     });
+}
+
+pub(super) fn section_header_text(palette: ThemePalette, title: &str) -> RichText {
+    RichText::new(title.to_uppercase())
+        .font(FontId::new(12.5, FontFamily::Proportional))
+        .strong()
+        .extra_letter_spacing(0.6)
+        .color(palette.text_secondary)
+}
+
+pub(super) fn section_heading(ui: &mut egui::Ui, palette: ThemePalette, title: &str) {
+    ui.label(section_header_text(palette, title));
+}
+
+/// A framed on/off button, so toggles line up visually with ordinary buttons.
+pub(super) fn toggle_button<'a>(
+    selected: bool,
+    atoms: impl egui::IntoAtoms<'a>,
+) -> egui::Button<'a> {
+    egui::Button::selectable(selected, atoms).frame_when_inactive(true)
+}
+
+/// Draws a thin vertical divider between toolbar groups.
+pub(super) fn toolbar_divider(ui: &mut egui::Ui, palette: ThemePalette) {
+    ui.add_space(2.0);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 22.0), egui::Sense::hover());
+    ui.painter().vline(
+        rect.center().x,
+        rect.y_range(),
+        Stroke::new(1.0, palette.panel_stroke),
+    );
+    ui.add_space(2.0);
 }
 
 pub(super) fn pill_text(text: impl Into<String>, fill: Color32, text_color: Color32) -> RichText {

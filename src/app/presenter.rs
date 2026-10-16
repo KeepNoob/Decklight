@@ -12,7 +12,7 @@ use super::timing::TimingBreakdownState;
 use crate::cache::PageCache;
 use crate::config::{AppConfig, NotesLayout, NotesLayoutOverrideConfig};
 use crate::document::{DocumentBackend, TextAnnotation};
-use eframe::egui::{Context, TextureHandle, ViewportId};
+use eframe::egui::{Context, Rect, TextureHandle, ViewportId};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -22,6 +22,32 @@ pub(super) struct CachedResolvedLayout {
     pub(super) layout: Option<NotesLayout>,
     pub(super) reason: Option<String>,
     pub(super) warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SettingsTab {
+    General,
+    Notes,
+    Performance,
+    Keybindings,
+}
+
+impl SettingsTab {
+    pub(super) const ALL: [SettingsTab; 4] = [
+        SettingsTab::General,
+        SettingsTab::Notes,
+        SettingsTab::Performance,
+        SettingsTab::Keybindings,
+    ];
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            SettingsTab::General => "General",
+            SettingsTab::Notes => "Notes",
+            SettingsTab::Performance => "Performance",
+            SettingsTab::Keybindings => "Keybindings",
+        }
+    }
 }
 
 pub(super) struct PresenterApp {
@@ -101,7 +127,11 @@ pub(super) struct PresenterApp {
     pub(super) auto_override_editor_secs: u32,
     pub(super) auto_override_editor_index: Option<usize>,
     pub(super) timing_breakdown: TimingBreakdownState,
-    pub(super) performance_panel_open: bool,
+    pub(super) settings_open: bool,
+    pub(super) settings_tab: SettingsTab,
+    pub(super) slides_column_fraction: f32,
+    /// Where the floating pen/edit actions panel is anchored, so it never covers the timers.
+    pub(super) notes_area_rect: Rect,
     pub(super) shortcut_bindings: ShortcutBindings,
     pub(super) keybinding_editor: BTreeMap<String, String>,
     pub(super) keybinding_editor_dirty: bool,

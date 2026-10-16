@@ -115,13 +115,19 @@ impl NotesLayoutOverrideConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PresenterLayoutConfig {
     pub preview_slides: u8,
+    /// Share of the presenter window width given to the slide previews column.
+    pub slides_column_percent: u8,
 }
 
 impl Default for PresenterLayoutConfig {
     fn default() -> Self {
-        Self { preview_slides: 1 }
+        Self {
+            preview_slides: 1,
+            slides_column_percent: 40,
+        }
     }
 }
 
@@ -365,6 +371,8 @@ impl AppConfig {
         self.next_render_width = self.next_render_width.clamp(640, 4096);
         self.notes_render_width = self.notes_render_width.clamp(640, 4096);
         self.presenter_layout.preview_slides = self.presenter_layout.preview_slides.clamp(1, 16);
+        self.presenter_layout.slides_column_percent =
+            self.presenter_layout.slides_column_percent.clamp(20, 80);
         self.notes_confidence_threshold = self.notes_confidence_threshold.clamp(0.05, 0.95);
         self.overview_thumbnail_width = self.overview_thumbnail_width.clamp(120, 800);
         self.overview_columns = self.overview_columns.clamp(2, 8);

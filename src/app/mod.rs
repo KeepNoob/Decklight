@@ -20,7 +20,7 @@ use self::interaction::{
     SessionInkStroke, SlideRegion, SlideSurfaceSpace, TransformMode, ZoomPanState,
 };
 use self::overview::DeckOverviewState;
-use self::presenter::{CachedResolvedLayout, PresenterApp};
+use self::presenter::{CachedResolvedLayout, PresenterApp, SettingsTab};
 use self::render_cache::CachedTexture;
 use self::render_worker::{
     RenderJob, RenderJobKey, RenderJobKind, RenderPriority, RenderResult, RenderTask, RenderWorker,
@@ -28,7 +28,10 @@ use self::render_worker::{
 };
 use self::shortcuts::{ShortcutAction, ShortcutBindings};
 use self::theme::{ThemePalette, card_frame, inset_frame, install_visual_style, quiet_label};
-use self::theme::{pill_text, section_title, status_pill, theme_label};
+use self::theme::{
+    section_header_text, section_heading, section_title, status_pill, theme_label, toggle_button,
+    toolbar_divider,
+};
 use self::timing::{TimingBreakdownModel, TimingBreakdownRow, TimingBreakdownState};
 use crate::cache::PageCache;
 use crate::config::{
@@ -146,6 +149,8 @@ impl PresenterApp {
         let keybinding_editor = Self::build_keybinding_editor(&config.keybindings);
         let keybinding_warning =
             (!shortcut_warnings.is_empty()).then(|| shortcut_warnings.join(" "));
+        let slides_column_fraction =
+            f32::from(config.presenter_layout.slides_column_percent) / 100.0;
         let mut app = Self {
             texture_cache: PageCache::new(config.cache_size, Self::cache_budget_bytes_for(&config)),
             state: PresentationState::with_labels(1, vec!["1".to_owned()], now),
@@ -223,7 +228,10 @@ impl PresenterApp {
             auto_override_editor_secs: auto_default_interval,
             auto_override_editor_index: None,
             timing_breakdown: TimingBreakdownState::default(),
-            performance_panel_open: false,
+            settings_open: false,
+            settings_tab: SettingsTab::General,
+            slides_column_fraction,
+            notes_area_rect: Rect::NOTHING,
             shortcut_bindings,
             keybinding_editor,
             keybinding_editor_dirty: false,
@@ -269,58 +277,57 @@ impl PresenterApp {
     }
 
     fn render_keybindings_editor(&mut self, ui: &mut egui::Ui) {
-        ui.collapsing("Keybindings", |ui| {
-            ui.label("Set one key per action (e.g. ArrowRight, PageDown, Space, G).");
-            ui.label("Ctrl+S remains reserved for Save.");
-            ui.add_space(4.0);
+        let palette = self.palette();
+        quiet_label(
+            ui,
+            palette,
+            "Set one key per action (e.g. ArrowRight, PageDown, Space, G). Ctrl+S stays reserved for Save.",
+        );
+        ui.add_space(4.0);
 
-            egui::ScrollArea::vertical()
-                .max_height(240.0)
-                .show(ui, |ui| {
-                    egui::Grid::new("keybinding_editor_grid")
-                        .num_columns(3)
-                        .spacing(Vec2::new(10.0, 6.0))
-                        .striped(true)
-                        .show(ui, |ui| {
-                            ui.strong("Action");
-                            ui.strong("Key");
-                            ui.strong("Default");
-                            ui.end_row();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    self.keybinding_editor_dirty,
+                    egui::Button::new("Apply Keybindings"),
+                )
+                .clicked()
+            {
+                self.apply_keybinding_editor();
+            }
 
-                            for action in ShortcutAction::ALL {
-                                ui.label(action.title());
-                                let entry = self
-                                    .keybinding_editor
-                                    .entry(action.id().to_owned())
-                                    .or_insert_with(|| action.default_key().name().to_owned());
-                                let changed = ui.text_edit_singleline(entry).changed();
-                                if changed {
-                                    self.keybinding_editor_dirty = true;
-                                }
-                                ui.monospace(action.default_key().name());
-                                ui.end_row();
-                            }
-                        });
-                });
+            if ui.button("Reset Defaults").clicked() {
+                self.keybinding_editor = KeybindingConfig::default().bindings;
+                self.keybinding_editor_dirty = true;
+                self.apply_keybinding_editor();
+            }
+        });
+        ui.add_space(4.0);
 
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        self.keybinding_editor_dirty,
-                        egui::Button::new("Apply Keybindings"),
-                    )
-                    .clicked()
-                {
-                    self.apply_keybinding_editor();
-                }
+        egui::Grid::new("keybinding_editor_grid")
+            .num_columns(3)
+            .spacing(Vec2::new(10.0, 6.0))
+            .striped(true)
+            .show(ui, |ui| {
+                ui.strong("Action");
+                ui.strong("Key");
+                ui.strong("Default");
+                ui.end_row();
 
-                if ui.button("Reset Defaults").clicked() {
-                    self.keybinding_editor = KeybindingConfig::default().bindings;
-                    self.keybinding_editor_dirty = true;
-                    self.apply_keybinding_editor();
+                for action in ShortcutAction::ALL {
+                    ui.label(action.title());
+                    let entry = self
+                        .keybinding_editor
+                        .entry(action.id().to_owned())
+                        .or_insert_with(|| action.default_key().name().to_owned());
+                    let changed = ui.text_edit_singleline(entry).changed();
+                    if changed {
+                        self.keybinding_editor_dirty = true;
+                    }
+                    ui.monospace(action.default_key().name());
+                    ui.end_row();
                 }
             });
-        });
     }
 
     fn render_performance_controls(&mut self, ui: &mut egui::Ui) {
@@ -823,47 +830,22 @@ impl PresenterApp {
             self.apply_command(AppCommand::ToggleLabelMode);
         }
         if !typing_in_text_field && self.shortcut_consume(ctx, ShortcutAction::ToggleLaser) {
-            self.apply_command(AppCommand::ToggleLaser);
-            if !self.state.laser_enabled {
-                self.laser_position = None;
-            }
+            self.toggle_laser();
         }
         if !typing_in_text_field && self.shortcut_consume(ctx, ShortcutAction::ToggleAutoAdvance) {
             self.apply_command(AppCommand::ToggleAutoAdvance);
         }
-        let highlight_toggle =
-            !typing_in_text_field && self.shortcut_consume(ctx, ShortcutAction::ToggleHighlight);
-        if highlight_toggle {
-            self.apply_command(AppCommand::ToggleHighlight);
-            if self.state.highlight_enabled {
-                self.annotation_edit_enabled = false;
-            } else {
-                self.stroke_in_progress.clear();
-                self.stroke_in_progress_style = None;
-            }
+        if !typing_in_text_field && self.shortcut_consume(ctx, ShortcutAction::ToggleHighlight) {
+            self.toggle_highlight_mode();
         }
-        let annotation_toggle = !typing_in_text_field
-            && self.shortcut_consume(ctx, ShortcutAction::ToggleAnnotationEdit);
-        if annotation_toggle {
-            self.annotation_edit_enabled = !self.annotation_edit_enabled;
-            if self.annotation_edit_enabled {
-                self.state.highlight_enabled = false;
-                self.stroke_in_progress.clear();
-                self.stroke_in_progress_style = None;
-            }
+        if !typing_in_text_field && self.shortcut_consume(ctx, ShortcutAction::ToggleAnnotationEdit)
+        {
+            self.toggle_annotation_edit_mode();
         }
         if !typing_in_text_field
             && self.shortcut_consume(ctx, ShortcutAction::ToggleProjectorFullscreen)
         {
-            if self.single_monitor_zoom_share {
-                self.status_message = Some(
-                    "Fullscreen is disabled in Zoom Share mode. Exit Zoom Share to change it."
-                        .to_owned(),
-                );
-            } else {
-                self.apply_command(AppCommand::ToggleProjectorFullscreen);
-                self.persist_config();
-            }
+            self.toggle_projector_fullscreen();
         }
         if !typing_in_text_field && self.shortcut_consume(ctx, ShortcutAction::ResetTimer) {
             self.apply_command(AppCommand::ResetTimer);
@@ -922,6 +904,62 @@ impl PresenterApp {
             && self.shortcut_consume(ctx, ShortcutAction::ApplyPresetToSelectedStrokes)
         {
             self.apply_active_preset_to_selected_strokes(self.presenter_display_index());
+        }
+    }
+
+    fn toggle_laser(&mut self) {
+        self.apply_command(AppCommand::ToggleLaser);
+        if !self.state.laser_enabled {
+            self.laser_position = None;
+        }
+    }
+
+    fn toggle_highlight_mode(&mut self) {
+        self.apply_command(AppCommand::ToggleHighlight);
+        if self.state.highlight_enabled {
+            self.annotation_edit_enabled = false;
+        } else {
+            self.stroke_in_progress.clear();
+            self.stroke_in_progress_style = None;
+        }
+    }
+
+    fn toggle_annotation_edit_mode(&mut self) {
+        self.annotation_edit_enabled = !self.annotation_edit_enabled;
+        if self.annotation_edit_enabled {
+            self.state.highlight_enabled = false;
+            self.stroke_in_progress.clear();
+            self.stroke_in_progress_style = None;
+        }
+    }
+
+    fn toggle_projector_fullscreen(&mut self) {
+        if self.single_monitor_zoom_share {
+            self.status_message = Some(
+                "Fullscreen is disabled in Zoom Share mode. Exit Zoom Share to change it."
+                    .to_owned(),
+            );
+        } else {
+            self.apply_command(AppCommand::ToggleProjectorFullscreen);
+            self.persist_config();
+        }
+    }
+
+    fn toggle_zoom_share_mode(&mut self, ctx: &Context) {
+        self.single_monitor_zoom_share = !self.single_monitor_zoom_share;
+        self.status_message = Some(if self.single_monitor_zoom_share {
+            "Zoom Share enabled.".to_owned()
+        } else {
+            "Second Display mode enabled.".to_owned()
+        });
+        ctx.request_repaint_of(self.projector_viewport);
+    }
+
+    /// Appends the currently bound key for `action` to `label`, for tooltips.
+    fn shortcut_hint(&self, label: &str, action: ShortcutAction) -> String {
+        match self.shortcut_bindings.key_for(action) {
+            Some(key) => format!("{label} ({})", key.symbol_or_name()),
+            None => label.to_owned(),
         }
     }
 
@@ -3278,22 +3316,29 @@ impl PresenterApp {
         let note_actions_enabled = mode == InteractionMode::AnnotationEdit && selected_exists;
         let can_save = self.has_unsaved_annotation_changes();
 
+        let palette = self.palette();
         let overlay_id = egui::Id::unique("quick_actions_overlay");
-        let overlay_width = (image_rect.width() - 20.0).clamp(220.0, 560.0);
-        let overlay_offset = Vec2::new(16.0, -16.0);
+        let anchor_rect = self.notes_area_rect;
+        let overlay_width = (image_rect.width() - 20.0)
+            .min(anchor_rect.width() - 32.0)
+            .clamp(220.0, 560.0);
         egui::Area::new(overlay_id)
             .order(egui::Order::Foreground)
-            .anchor(Align2::LEFT_BOTTOM, overlay_offset)
+            .pivot(Align2::LEFT_BOTTOM)
+            .fixed_pos(anchor_rect.left_bottom() + Vec2::new(16.0, -16.0))
             .show(ui.ctx(), |ui| {
                 ui.set_width(overlay_width);
                 ui.set_max_width(overlay_width);
+                let fill = palette.panel_elevated;
                 let frame = egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(19, 25, 34, 232))
-                    .stroke(Stroke::new(
-                        1.0,
-                        Color32::from_rgba_unmultiplied(85, 105, 126, 225),
+                    .fill(Color32::from_rgba_unmultiplied(
+                        fill.r(),
+                        fill.g(),
+                        fill.b(),
+                        238,
                     ))
-                    .corner_radius(14.0)
+                    .stroke(Stroke::new(1.0, palette.panel_stroke))
+                    .corner_radius(12.0)
                     .inner_margin(egui::Margin::same(10));
                 frame.show(ui, |ui| {
                     self.render_pen_toolkit_controls(ui, true, index);
@@ -4719,23 +4764,6 @@ impl PresenterApp {
         self.timing_breakdown.is_open = open;
     }
 
-    fn render_performance_panel(&mut self, ctx: &Context) {
-        if !self.performance_panel_open {
-            return;
-        }
-
-        let mut open = self.performance_panel_open;
-        egui::Window::new("Performance")
-            .open(&mut open)
-            .resizable(true)
-            .default_width(420.0)
-            .frame(self.card_frame())
-            .show(ctx, |ui| {
-                self.render_performance_controls(ui);
-            });
-        self.performance_panel_open = open;
-    }
-
     fn notes_text(&self) -> String {
         if self.document.is_none() {
             return "Load a document to show notes.".to_owned();
@@ -5314,57 +5342,110 @@ impl PresenterApp {
         }
         let palette = self.palette();
 
+        self.render_presenter_toolbar(ui, ctx, display_index);
+        self.render_status_bar(ui, &talk_elapsed, &slide_elapsed, &wall_clock);
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.app_background)
+                    .inner_margin(egui::Margin::same(12)),
+            )
+            .show(ui, |ui| {
+                let full_rect = ui.available_rect_before_wrap();
+                let handle_width = 12.0;
+                let usable_width = (full_rect.width() - handle_width).max(0.0);
+                let min_column_width = 300.0_f32.min(usable_width / 2.0);
+                let slides_width = (usable_width * self.slides_column_fraction)
+                    .clamp(min_column_width, usable_width - min_column_width);
+                let handle_left = full_rect.max.x - slides_width - handle_width;
+                let notes_rect =
+                    Rect::from_min_max(full_rect.min, Pos2::new(handle_left, full_rect.max.y));
+                let handle_rect = Rect::from_min_max(
+                    Pos2::new(handle_left, full_rect.min.y),
+                    Pos2::new(handle_left + handle_width, full_rect.max.y),
+                );
+                let slides_rect = Rect::from_min_max(
+                    Pos2::new(handle_rect.max.x, full_rect.min.y),
+                    full_rect.max,
+                );
+
+                let handle = ui.interact(
+                    handle_rect,
+                    egui::Id::unique("slides_column_handle"),
+                    Sense::drag(),
+                );
+                if handle.hovered() || handle.dragged() {
+                    ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+                if handle.dragged() && usable_width > 0.0 {
+                    let dragged_width = slides_width - handle.drag_delta().x;
+                    self.slides_column_fraction = (dragged_width / usable_width).clamp(0.2, 0.8);
+                }
+                if handle.drag_stopped() {
+                    self.config.presenter_layout.slides_column_percent =
+                        (self.slides_column_fraction * 100.0)
+                            .round()
+                            .clamp(20.0, 80.0) as u8;
+                    self.persist_config();
+                }
+                let grip_color = if handle.hovered() || handle.dragged() {
+                    palette.accent
+                } else {
+                    palette.panel_stroke
+                };
+                let grip_half_height = 24.0_f32.min(handle_rect.height() / 2.0);
+                ui.painter().line_segment(
+                    [
+                        handle_rect.center() - Vec2::new(0.0, grip_half_height),
+                        handle_rect.center() + Vec2::new(0.0, grip_half_height),
+                    ],
+                    Stroke::new(3.0, grip_color),
+                );
+
+                self.notes_area_rect = notes_rect;
+                ui.scope_builder(egui::UiBuilder::new().max_rect(notes_rect), |ui| {
+                    self.render_notes_card(ui);
+                });
+                ui.scope_builder(egui::UiBuilder::new().max_rect(slides_rect), |ui| {
+                    self.render_slides_column(ui, ctx, display_index, display_layout);
+                });
+                ui.allocate_rect(full_rect, Sense::hover());
+            });
+
+        self.render_deck_overview(ctx);
+        self.render_timing_breakdown(ctx);
+        self.render_settings_window(ctx);
+    }
+
+    fn render_presenter_toolbar(&mut self, ui: &mut egui::Ui, ctx: &Context, display_index: usize) {
+        let palette = self.palette();
         egui::Panel::top("top_controls")
             .frame(
                 egui::Frame::new()
                     .fill(palette.top_bar)
                     .stroke(Stroke::new(1.0, palette.panel_stroke))
-                    .inner_margin(egui::Margin::symmetric(14, 10)),
+                    .inner_margin(egui::Margin::symmetric(12, 8)),
             )
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new("Decklight")
-                            .font(FontId::new(20.0, FontFamily::Proportional))
-                            .strong()
-                            .color(palette.text_primary),
-                    );
-                    quiet_label(ui, palette, "Dual-screen PDF presenter");
-                    ui.separator();
-                    status_pill(ui, palette, "Laser", self.state.laser_enabled);
-                    status_pill(ui, palette, "Highlight", self.state.highlight_enabled);
-                    status_pill(ui, palette, "Edit", self.annotation_edit_enabled);
-                    if self.has_unsaved_annotation_changes() {
-                        ui.label(pill_text(
-                            "Unsaved",
-                            palette.unsaved_pill,
-                            palette.unsaved_pill_text,
-                        ));
-                    }
-                });
+                    ui.spacing_mut().item_spacing.x = 4.0;
 
-                ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("PDF").color(palette.text_secondary));
                     let current_path = self.source_path_input.trim().to_owned();
                     let current_filename = Path::new(&current_path)
                         .file_name()
                         .map(|filename| filename.to_string_lossy().into_owned())
                         .filter(|filename| !filename.is_empty());
                     let open_clicked = ui
-                        .add(
-                            egui::Button::new(RichText::new("Open PDF…").strong())
-                                .fill(palette.accent_soft)
-                                .stroke(Stroke::new(1.0, palette.accent)),
-                        )
+                        .button("📂 Open")
+                        .on_hover_text("Open a PDF")
                         .clicked();
                     if open_clicked && let Some(path) = self.open_pdf_dialog() {
                         self.source_path_input = path.display().to_string();
                         self.request_load_document(path);
                     }
-                    let filename_width = (ui.available_width() * 0.24).clamp(120.0, 260.0);
                     let filename_response = ui.add_sized(
-                        Vec2::new(filename_width, 30.0),
+                        Vec2::new(150.0, ui.spacing().interact_size.y),
                         egui::Label::new(
                             RichText::new(current_filename.as_deref().unwrap_or("No PDF selected"))
                                 .color(palette.text_secondary),
@@ -5374,872 +5455,1007 @@ impl PresenterApp {
                     if !current_path.is_empty() {
                         filename_response.on_hover_text(current_path);
                     }
+                    toolbar_divider(ui, palette);
 
-                    ui.separator();
-                    if ui.button("Prev").clicked() {
-                        self.apply_command(AppCommand::PreviousSlide);
-                    }
-                    if ui.button("Next").clicked() {
-                        self.apply_command(AppCommand::NextSlide);
-                    }
-                    if ui.button("First").clicked() {
+                    if ui
+                        .button("« First")
+                        .on_hover_text(self.shortcut_hint("First slide", ShortcutAction::First))
+                        .clicked()
+                    {
                         self.apply_command(AppCommand::FirstSlide);
                     }
-                    if ui.button("Last").clicked() {
+                    if ui
+                        .button("‹ Prev")
+                        .on_hover_text(
+                            self.shortcut_hint("Previous slide", ShortcutAction::Previous),
+                        )
+                        .clicked()
+                    {
+                        self.apply_command(AppCommand::PreviousSlide);
+                    }
+                    let total_slides = self.state.total_slides();
+                    let counter = if total_slides == 0 {
+                        "– / –".to_owned()
+                    } else {
+                        format!("{} / {}", display_index + 1, total_slides)
+                    };
+                    ui.add_sized(
+                        Vec2::new(84.0, ui.spacing().interact_size.y),
+                        egui::Label::new(
+                            RichText::new(counter)
+                                .font(FontId::new(15.0, FontFamily::Monospace))
+                                .strong()
+                                .color(palette.text_primary),
+                        ),
+                    );
+                    if ui
+                        .button("Next ›")
+                        .on_hover_text(self.shortcut_hint("Next slide", ShortcutAction::Next))
+                        .clicked()
+                    {
+                        self.apply_command(AppCommand::NextSlide);
+                    }
+                    if ui
+                        .button("Last »")
+                        .on_hover_text(self.shortcut_hint("Last slide", ShortcutAction::Last))
+                        .clicked()
+                    {
                         self.apply_command(AppCommand::LastSlide);
                     }
-                    if ui.button("Swap (S)").clicked() {
+                    toolbar_divider(ui, palette);
+
+                    let laser_hint = format!(
+                        "{}\nOr hold Ctrl and click/drag on the slide for a temporary pointer.",
+                        self.shortcut_hint("Laser pointer", ShortcutAction::ToggleLaser)
+                    );
+                    if ui
+                        .add(toggle_button(self.state.laser_enabled, "🔦 Laser"))
+                        .on_hover_text(laser_hint)
+                        .clicked()
+                    {
+                        self.toggle_laser();
+                    }
+                    if ui
+                        .add(toggle_button(
+                            self.state.highlight_enabled,
+                            "🖊 Highlight",
+                        ))
+                        .on_hover_text(
+                            self.shortcut_hint("Draw highlights", ShortcutAction::ToggleHighlight),
+                        )
+                        .clicked()
+                    {
+                        self.toggle_highlight_mode();
+                    }
+                    if ui
+                        .add(toggle_button(self.annotation_edit_enabled, "✏ Edit"))
+                        .on_hover_text(self.shortcut_hint(
+                            "Edit PDF notes",
+                            ShortcutAction::ToggleAnnotationEdit,
+                        ))
+                        .clicked()
+                    {
+                        self.toggle_annotation_edit_mode();
+                    }
+                    toolbar_divider(ui, palette);
+
+                    if ui
+                        .button("⇄ Swap")
+                        .on_hover_text(self.shortcut_hint(
+                            "Swap presenter and projector screens",
+                            ShortcutAction::SwapScreens,
+                        ))
+                        .clicked()
+                    {
                         self.apply_command(AppCommand::SwapScreens);
                     }
-                    let mode_response = ui.button(if self.single_monitor_zoom_share {
-                        "Mode: Zoom Share"
+                    let mode_label = if self.single_monitor_zoom_share {
+                        "🖥 Zoom Share"
                     } else {
-                        "Mode: Second Display"
-                    });
-                    let mode_clicked = mode_response.clicked();
-                    mode_response.on_hover_text(
-                        "Zoom Share keeps the projector on the same macOS Desktop behind Presenter for window sharing.",
-                    );
-                    if mode_clicked {
-                        self.single_monitor_zoom_share = !self.single_monitor_zoom_share;
-                        self.status_message = Some(if self.single_monitor_zoom_share {
-                            "Zoom Share enabled.".to_owned()
-                        } else {
-                            "Second Display mode enabled.".to_owned()
-                        });
-                        ctx.request_repaint_of(self.projector_viewport);
+                        "🖥 2nd Display"
+                    };
+                    if ui
+                        .button(mode_label)
+                        .on_hover_text(
+                            "Click to switch between Second Display and Zoom Share.\nZoom Share keeps the projector on the same macOS Desktop behind Presenter for window sharing.",
+                        )
+                        .clicked()
+                    {
+                        self.toggle_zoom_share_mode(ctx);
                     }
                     let fullscreen_response = ui.add_enabled(
                         !self.single_monitor_zoom_share,
-                        egui::Button::new("Fullscreen (F)"),
+                        toggle_button(self.state.projector_fullscreen, "⛶ Fullscreen"),
                     );
                     let fullscreen_clicked = fullscreen_response.clicked();
                     if self.single_monitor_zoom_share {
-                        fullscreen_response.on_hover_text(
+                        fullscreen_response.on_disabled_hover_text(
                             "Fullscreen is disabled in Zoom Share mode. Exit Zoom Share to change it.",
                         );
+                    } else {
+                        fullscreen_response.on_hover_text(self.shortcut_hint(
+                            "Projector fullscreen",
+                            ShortcutAction::ToggleProjectorFullscreen,
+                        ));
                     }
                     if fullscreen_clicked {
-                        self.apply_command(AppCommand::ToggleProjectorFullscreen);
-                        self.persist_config();
+                        self.toggle_projector_fullscreen();
                     }
-                    if ui.button("Save").clicked() {
+                    toolbar_divider(ui, palette);
+
+                    let save_button = if self.has_unsaved_annotation_changes() {
+                        egui::Button::new(
+                            RichText::new("💾 Save •").color(palette.unsaved_pill_text),
+                        )
+                        .fill(palette.unsaved_pill)
+                    } else {
+                        egui::Button::new("💾 Save")
+                    };
+                    let save_hint = if self.has_unsaved_annotation_changes() {
+                        "Unsaved annotation changes. Save them into the PDF (Ctrl+S)"
+                    } else {
+                        "Save annotations into the PDF (Ctrl+S)"
+                    };
+                    if ui.add(save_button).on_hover_text(save_hint).clicked() {
                         self.save_document_in_place();
                     }
-                    if ui.button("Timing").clicked() {
+                    if ui
+                        .add(toggle_button(
+                            self.timing_breakdown.is_open,
+                            "⏱ Timing",
+                        ))
+                        .on_hover_text(self.shortcut_hint(
+                            "Per-slide timing breakdown",
+                            ShortcutAction::ToggleTimingBreakdown,
+                        ))
+                        .clicked()
+                    {
                         self.timing_breakdown.toggle();
                     }
-                    if ui.button("Reset View").clicked() {
-                        Self::reset_zoom_pan_state(&mut self.presenter_zoom_pan);
-                        Self::reset_zoom_pan_state(&mut self.projector_zoom_pan);
-                    }
-                    if ui.button("Performance").clicked() {
-                        self.performance_panel_open = true;
-                    }
-                    ui.separator();
-                    ui.label(RichText::new("Theme").color(palette.text_secondary));
-                    let mut theme_changed = false;
-                    egui::ComboBox::from_id_salt("app_theme")
-                        .selected_text(theme_label(self.config.theme))
-                        .show_ui(ui, |ui| {
-                            theme_changed |= ui
-                                .selectable_value(&mut self.config.theme, AppTheme::Dark, "Dark")
-                                .changed();
-                            theme_changed |= ui
-                                .selectable_value(&mut self.config.theme, AppTheme::Light, "Light")
-                                .changed();
-                            theme_changed |= ui
-                                .selectable_value(
-                                    &mut self.config.theme,
-                                    AppTheme::ProjectorSafe,
-                                    "Projector-safe",
-                                )
-                                .changed();
-                        });
-                    if theme_changed {
-                        install_visual_style(ctx, self.config.theme);
-                        self.persist_config();
+                    if ui
+                        .add(toggle_button(self.settings_open, "⚙ Settings"))
+                        .on_hover_text("Theme, notes split, performance and keybindings")
+                        .clicked()
+                    {
+                        self.settings_open = !self.settings_open;
                     }
                 });
             });
+    }
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(palette.app_background))
+    fn render_status_bar(
+        &self,
+        ui: &mut egui::Ui,
+        talk_elapsed: &str,
+        slide_elapsed: &str,
+        wall_clock: &str,
+    ) {
+        let palette = self.palette();
+        egui::Panel::bottom("status_bar")
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.top_bar)
+                    .stroke(Stroke::new(1.0, palette.panel_stroke))
+                    .inner_margin(egui::Margin::symmetric(14, 6)),
+            )
             .show(ui, |ui| {
-            let available = ui.available_size();
-            let left_width = available.x * 0.60;
-            let right_width = (available.x - left_width - 8.0).max(280.0);
+                ui.horizontal(|ui| {
+                    Self::status_bar_readout(
+                        ui,
+                        palette,
+                        "Talk",
+                        talk_elapsed,
+                        palette.talk_pill_text,
+                    )
+                    .on_hover_text(
+                        self.shortcut_hint("Reset talk timer", ShortcutAction::ResetTimer),
+                    );
+                    ui.add_space(12.0);
+                    Self::status_bar_readout(
+                        ui,
+                        palette,
+                        "Slide",
+                        slide_elapsed,
+                        palette.slide_pill_text,
+                    );
+                    ui.add_space(12.0);
+                    Self::status_bar_readout(
+                        ui,
+                        palette,
+                        "Clock",
+                        wall_clock,
+                        palette.text_primary,
+                    );
+                    if self.state.auto_advance_enabled() {
+                        let countdown = self
+                            .state
+                            .auto_advance_remaining(Instant::now())
+                            .map(Self::format_duration)
+                            .unwrap_or_else(|| "--:--:--".to_owned());
+                        ui.add_space(12.0);
+                        Self::status_bar_readout(ui, palette, "Auto", &countdown, palette.accent);
+                    }
 
+                    let message = if let Some(error) = &self.open_error {
+                        Some((error.as_str(), palette.danger))
+                    } else if let Some(warning) = &self.keybinding_warning {
+                        Some((warning.as_str(), palette.warning))
+                    } else {
+                        self.status_message
+                            .as_deref()
+                            .map(|status| (status, palette.text_secondary))
+                    };
+                    if let Some((text, color)) = message {
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            ui.add(egui::Label::new(RichText::new(text).color(color)).truncate())
+                                .on_hover_text(text);
+                        });
+                    }
+                });
+            });
+    }
+
+    fn status_bar_readout(
+        ui: &mut egui::Ui,
+        palette: ThemePalette,
+        caption: &str,
+        value: &str,
+        value_color: Color32,
+    ) -> egui::Response {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(section_header_text(palette, caption));
+            ui.label(
+                RichText::new(value)
+                    .font(FontId::new(18.0, FontFamily::Monospace))
+                    .strong()
+                    .color(value_color),
+            );
+        })
+        .response
+    }
+
+    fn render_notes_card(&mut self, ui: &mut egui::Ui) {
+        let palette = self.palette();
+        self.card_frame().show(ui, |ui| {
+            ui.set_min_size(ui.available_size());
             ui.horizontal(|ui| {
-                ui.allocate_ui_with_layout(
-                    Vec2::new(left_width.max(320.0), available.y),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        self.card_frame().show(ui, |ui| {
-                            section_title(ui, palette, "Notes", Some("speaker view"));
-                            quiet_label(ui, palette, self.notes_text());
-                            if let Some(warning) = &self.layout_warning {
-                                ui.colored_label(palette.warning, warning);
-                            }
-                            let mut override_changed = false;
-                            ui.horizontal_wrapped(|ui| {
-                                override_changed |= ui
-                                    .checkbox(
-                                        &mut self.manual_layout_override.enabled,
-                                        "Manual split override",
-                                    )
-                                    .changed();
-                                if ui
-                                    .add_enabled(
-                                        !self.manual_layout_override.enabled,
-                                        egui::Button::new("Use Manual"),
-                                    )
-                                    .clicked()
-                                {
-                                    self.manual_layout_override.enabled = true;
-                                    override_changed = true;
-                                }
-                                if ui
-                                    .add_enabled(
-                                        self.manual_layout_override.enabled,
-                                        egui::Button::new("Auto"),
-                                    )
-                                    .clicked()
-                                {
-                                    self.manual_layout_override.enabled = false;
-                                    override_changed = true;
-                                }
-                            });
-
-                            let manual_enabled = self.manual_layout_override.enabled;
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("Axis:");
-                                ui.add_enabled_ui(manual_enabled, |ui| {
-                                    egui::ComboBox::from_id_salt("notes_manual_axis_compact")
-                                        .selected_text(match self.manual_layout_override.axis {
-                                            SplitAxis::Vertical => "Vertical",
-                                            SplitAxis::Horizontal => "Horizontal",
-                                        })
-                                        .show_ui(ui, |ui| {
-                                            override_changed |= ui
-                                                .selectable_value(
-                                                    &mut self.manual_layout_override.axis,
-                                                    SplitAxis::Vertical,
-                                                    "Vertical",
-                                                )
-                                                .changed();
-                                            override_changed |= ui
-                                                .selectable_value(
-                                                    &mut self.manual_layout_override.axis,
-                                                    SplitAxis::Horizontal,
-                                                    "Horizontal",
-                                                )
-                                                .changed();
-                                        });
-                                });
-
-                                ui.label("Side:");
-                                let side_label = match self.manual_layout_override.notes_side {
-                                    NotesSide::Left => "Left",
-                                    NotesSide::Right => "Right",
-                                    NotesSide::Top => "Top",
-                                    NotesSide::Bottom => "Bottom",
-                                };
-                                ui.add_enabled_ui(manual_enabled, |ui| {
-                                    egui::ComboBox::from_id_salt("notes_manual_side_compact")
-                                        .selected_text(side_label)
-                                        .show_ui(ui, |ui| match self.manual_layout_override.axis {
-                                            SplitAxis::Vertical => {
-                                                override_changed |= ui
-                                                    .selectable_value(
-                                                        &mut self.manual_layout_override.notes_side,
-                                                        NotesSide::Left,
-                                                        "Left",
-                                                    )
-                                                    .changed();
-                                                override_changed |= ui
-                                                    .selectable_value(
-                                                        &mut self.manual_layout_override.notes_side,
-                                                        NotesSide::Right,
-                                                        "Right",
-                                                    )
-                                                    .changed();
-                                            }
-                                            SplitAxis::Horizontal => {
-                                                override_changed |= ui
-                                                    .selectable_value(
-                                                        &mut self.manual_layout_override.notes_side,
-                                                        NotesSide::Top,
-                                                        "Top",
-                                                    )
-                                                    .changed();
-                                                override_changed |= ui
-                                                    .selectable_value(
-                                                        &mut self.manual_layout_override.notes_side,
-                                                        NotesSide::Bottom,
-                                                        "Bottom",
-                                                    )
-                                                    .changed();
-                                            }
-                                        });
-                                });
-
-                                ui.label("Split:");
-                                let mut split_percent =
-                                    (self.manual_layout_override.split_ratio * 100.0).round() as i32;
-                                if ui
-                                    .add_enabled(
-                                        manual_enabled,
-                                        egui::DragValue::new(&mut split_percent)
-                                            .range(0..=100)
-                                            .speed(0.5)
-                                            .suffix("%"),
-                                    )
-                                    .changed()
-                                {
-                                    self.manual_layout_override.split_ratio =
-                                        (split_percent as f32 / 100.0).clamp(0.0, 1.0);
-                                    override_changed = true;
-                                }
-                            });
-
-                            if !manual_enabled {
-                                ui.small("Enable manual split to set Axis / Side / Split %.");
-                            }
-
-                            if override_changed {
-                                self.manual_layout_override.sanitize();
-                                self.sync_override_to_config();
-                            }
-                            ui.separator();
-                            self.inset_frame().show(ui, |ui| {
-                                if let Some(texture) = self.notes_texture.as_ref() {
-                                    let max = ui.available_size_before_wrap();
-                                    let target = Self::fit_size(texture.size_vec2(), max);
-                                    let response = ui.image((texture.id(), target));
-                                    if self.notes_texture_pending {
-                                        let label = if self.notes_texture_low_res {
-                                            "Sharpening notes"
-                                        } else {
-                                            "Rendering notes"
-                                        };
-                                        Self::draw_rendering_overlay(
-                                            ui,
-                                            response.rect,
-                                            palette,
-                                            label,
-                                        );
-                                    }
-                            } else {
-                                quiet_label(
-                                    ui,
-                                    palette,
-                                    if self.notes_texture_pending {
-                                        "Rendering notes..."
-                                    } else {
-                                        "No notes region detected."
-                                    },
-                                );
-                            }
-                            });
-                        });
+                section_heading(ui, palette, "Notes");
+                status_pill(
+                    ui,
+                    palette,
+                    if self.manual_layout_override.enabled {
+                        "Manual split"
+                    } else {
+                        "Auto split"
                     },
+                    self.manual_layout_override.enabled,
                 );
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .button("Split settings…")
+                        .on_hover_text("Notes source, auto split threshold and manual split")
+                        .clicked()
+                    {
+                        self.settings_open = true;
+                        self.settings_tab = SettingsTab::Notes;
+                    }
+                });
+            });
+            ui.add(
+                egui::Label::new(
+                    RichText::new(self.notes_text())
+                        .small()
+                        .color(palette.text_secondary),
+                )
+                .truncate(),
+            );
+            if let Some(warning) = &self.layout_warning {
+                ui.add(
+                    egui::Label::new(RichText::new(warning).small().color(palette.warning))
+                        .truncate(),
+                );
+            }
+            ui.add_space(4.0);
+            self.inset_frame().show(ui, |ui| {
+                let area = ui.available_rect_before_wrap();
+                ui.allocate_rect(area, Sense::hover());
+                if let Some(texture) = self.notes_texture.as_ref() {
+                    let target = Self::fit_size(texture.size_vec2(), area.size());
+                    let image_rect = Rect::from_center_size(area.center(), target);
+                    let response = ui.put(image_rect, egui::Image::new((texture.id(), target)));
+                    if self.notes_texture_pending {
+                        let label = if self.notes_texture_low_res {
+                            "Sharpening notes"
+                        } else {
+                            "Rendering notes"
+                        };
+                        Self::draw_rendering_overlay(ui, response.rect, palette, label);
+                    }
+                } else {
+                    ui.put(
+                        area,
+                        egui::Label::new(
+                            RichText::new(if self.notes_texture_pending {
+                                "Rendering notes…"
+                            } else {
+                                "No notes region detected."
+                            })
+                            .color(palette.text_secondary),
+                        ),
+                    );
+                }
+            });
+        });
+    }
 
-                ui.allocate_ui_with_layout(
-                    Vec2::new(right_width, available.y),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        let right_available = ui.available_size_before_wrap();
-                        let preview_height = (right_available.y * 0.32).max(160.0);
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-
-                        self.card_frame().show(ui, |ui| {
-                            section_title(ui, palette, "Current Slide", Some("live controls"));
-                            if let Some(texture) = self.current_texture.as_ref() {
-                                let viewport_size = Vec2::new(ui.available_width(), preview_height);
-                                let (response, image_rect, reset_requested) =
-                                    Self::render_zoomable_texture_surface(
-                                        ui,
-                                        ctx,
-                                        texture,
-                                        viewport_size,
-                                        &mut self.presenter_zoom_pan,
-                                        palette,
-                                    );
-                                if reset_requested {
-                                    self.status_message = Some("Presenter view reset.".to_owned());
-                                }
-                                self.handle_current_slide_interaction(
-                                    &response,
-                                    image_rect,
-                                    display_index,
-                                    display_layout,
-                                );
-                                self.handle_annotation_interaction(
-                                    &response,
-                                    image_rect,
-                                    display_index,
-                                    display_layout,
-                                );
-                                let laser_sample =
-                                    Self::capture_laser_sample(ctx, &response, image_rect);
-                                self.consume_laser_sample(
-                                    laser_sample,
-                                    Self::slide_region(display_layout),
-                                    SlideSurfaceSpace::CroppedSlide,
-                                );
-                                self.draw_annotation_overlays(
-                                    ui,
-                                    image_rect,
-                                    response.rect,
-                                    display_index,
-                                    display_layout,
-                                );
-                                self.render_quick_actions_overlay(ui, image_rect, display_index);
-                                self.draw_unsaved_badge_on_preview(ui, image_rect);
-                                Self::draw_laser_overlay(
-                                    ui,
-                                    image_rect,
-                                    response.rect,
-                                    self.laser_position,
-                                    Self::slide_region(display_layout),
-                                    SlideSurfaceSpace::CroppedSlide,
-                                );
-                                ui.small(format!(
-                                    "Zoom {:.0}% | Pinch or Ctrl/Cmd+Wheel zoom | Two-finger scroll or Right/Middle drag pan | Double right-click reset",
+    fn render_slides_column(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &Context,
+        display_index: usize,
+        display_layout: Option<NotesLayout>,
+    ) {
+        let palette = self.palette();
+        let column_height = ui.available_height();
+        let current_height = (column_height * 0.46).max(180.0);
+        let next_height = (column_height * 0.26).max(120.0);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.card_frame().show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        section_heading(ui, palette, "Current");
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .small_button("⟲ Reset zoom")
+                                .on_hover_text("Reset zoom and pan on presenter and projector")
+                                .clicked()
+                            {
+                                Self::reset_zoom_pan_state(&mut self.presenter_zoom_pan);
+                                Self::reset_zoom_pan_state(&mut self.projector_zoom_pan);
+                            }
+                            ui.label(
+                                RichText::new(format!(
+                                    "{:.0}%",
                                     self.presenter_zoom_pan.zoom * 100.0
-                                ));
-                            } else {
-                                quiet_label(ui, palette, "No rendered current slide.");
-                            }
+                                ))
+                                .small()
+                                .color(palette.text_secondary),
+                            )
+                            .on_hover_text(
+                                "Pinch or Ctrl/Cmd+Wheel to zoom\nTwo-finger scroll or right/middle drag to pan\nDouble right-click to reset",
+                            );
                         });
+                    });
+                    if let Some(texture) = self.current_texture.as_ref() {
+                        let viewport_size = Vec2::new(ui.available_width(), current_height);
+                        let (response, image_rect, reset_requested) =
+                            Self::render_zoomable_texture_surface(
+                                ui,
+                                ctx,
+                                texture,
+                                viewport_size,
+                                &mut self.presenter_zoom_pan,
+                                palette,
+                            );
+                        if reset_requested {
+                            self.status_message = Some("Presenter view reset.".to_owned());
+                        }
+                        self.handle_current_slide_interaction(
+                            &response,
+                            image_rect,
+                            display_index,
+                            display_layout,
+                        );
+                        self.handle_annotation_interaction(
+                            &response,
+                            image_rect,
+                            display_index,
+                            display_layout,
+                        );
+                        let laser_sample = Self::capture_laser_sample(ctx, &response, image_rect);
+                        self.consume_laser_sample(
+                            laser_sample,
+                            Self::slide_region(display_layout),
+                            SlideSurfaceSpace::CroppedSlide,
+                        );
+                        self.draw_annotation_overlays(
+                            ui,
+                            image_rect,
+                            response.rect,
+                            display_index,
+                            display_layout,
+                        );
+                        self.render_quick_actions_overlay(ui, image_rect, display_index);
+                        self.draw_unsaved_badge_on_preview(ui, image_rect);
+                        Self::draw_laser_overlay(
+                            ui,
+                            image_rect,
+                            response.rect,
+                            self.laser_position,
+                            Self::slide_region(display_layout),
+                            SlideSurfaceSpace::CroppedSlide,
+                        );
+                    } else {
+                        quiet_label(ui, palette, "No rendered current slide.");
+                    }
+                });
 
-                        ui.add_space(6.0);
-                        self.card_frame().show(ui, |ui| {
-                            section_title(ui, palette, "Next Slide", Some("upcoming"));
-                            if let Some(texture) = self.next_texture.as_ref() {
-                                let max = Vec2::new(ui.available_width(), preview_height);
-                                let target = Self::fit_size(texture.size_vec2(), max);
-                                let response = ui.image((texture.id(), target));
-                                if self.next_texture_pending {
-                                    let label = if self.next_texture_low_res {
-                                        "Sharpening next"
-                                    } else {
-                                        "Rendering next"
-                                    };
-                                    Self::draw_rendering_overlay(
-                                        ui,
-                                        response.rect,
-                                        palette,
-                                        label,
-                                    );
-                                }
-                            } else {
-                                quiet_label(
-                                    ui,
-                                    palette,
-                                    if self.next_texture_pending {
-                                        "Rendering next slide..."
-                                    } else {
-                                        "No next slide."
-                                    },
-                                );
-                            }
-                        });
-
-                        ui.add_space(6.0);
-                        self.card_frame().show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                section_title(ui, palette, "Navigator", None);
-                                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                                    ui.label(RichText::new(wall_clock.as_str()).monospace());
-                                });
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Go To");
-                                ui.add_sized(
-                                    Vec2::new(90.0, 28.0),
-                                    egui::TextEdit::singleline(&mut self.go_to_input),
-                                );
-                                if ui.button("Go").clicked() {
-                                    self.submit_go_to();
-                                }
-                            });
-                            quiet_label(ui, palette, if self.state.use_slide_labels() {
-                                "Mode: slide label (J to toggle)"
-                            } else {
-                                "Mode: page number (J to toggle)"
-                            });
-                            ui.separator();
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{} / {}",
-                                        display_index + 1,
-                                        self.state.total_slides()
-                                    ))
-                                    .font(FontId::new(24.0, FontFamily::Proportional))
-                                    .strong()
-                                    .color(palette.text_primary),
-                                );
-                                ui.separator();
-                                quiet_label(ui, palette, format!(
-                                    "Label {}",
-                                    self.state.label_at(display_index).unwrap_or("N/A")
-                                ));
-                                ui.separator();
-                                quiet_label(ui, palette, format!(
-                                    "Next {}",
+                self.card_frame().show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        section_heading(ui, palette, "Next");
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(
                                     self.state
                                         .next_label_from(display_index)
-                                        .unwrap_or("End of deck")
-                                ));
-                            });
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(pill_text(
-                                    format!("Talk {talk_elapsed}"),
-                                    palette.talk_pill,
-                                    palette.talk_pill_text,
-                                ));
-                                ui.label(pill_text(
-                                    format!("Slide {slide_elapsed}"),
-                                    palette.slide_pill,
-                                    palette.slide_pill_text,
-                                ));
-                            });
-
-                            ui.separator();
-                            section_title(ui, palette, "Auto-Advance", None);
-                            ui.horizontal(|ui| {
-                                let enabled = self.state.auto_advance_enabled();
-                                if ui
-                                    .button(if enabled {
-                                        "Disable (T)"
-                                    } else {
-                                        "Enable (T)"
-                                    })
-                                    .clicked()
-                                {
-                                    self.apply_command(AppCommand::ToggleAutoAdvance);
-                                }
-
-                                let mut global_secs = self.state.auto_advance_global_interval_secs();
-                                let global_changed = ui
-                                    .add(
-                                        egui::DragValue::new(&mut global_secs)
-                                            .range(1..=3600)
-                                            .speed(0.5)
-                                            .suffix(" s"),
-                                    )
-                                    .changed();
-                                if global_changed {
-                                    self.apply_command(AppCommand::SetAutoAdvanceGlobalInterval(
-                                        global_secs,
-                                    ));
-                                    self.sync_auto_advance_profile_to_config();
-                                }
-                            });
-
-                            ui.horizontal(|ui| {
-                                ui.label(format!("Slide {} override:", display_index + 1));
-                                ui.add(
-                                    egui::DragValue::new(&mut self.auto_override_editor_secs)
-                                        .range(1..=3600)
-                                        .speed(0.5)
-                                        .suffix(" s"),
-                                );
-                                if ui.button("Set").clicked() {
-                                    self.apply_command(AppCommand::SetAutoAdvanceSlideOverride {
-                                        index: display_index,
-                                        secs: self.auto_override_editor_secs,
-                                    });
-                                    self.sync_auto_advance_profile_to_config();
-                                    self.auto_override_editor_secs =
-                                        self.state.auto_advance_effective_interval_secs(display_index);
-                                }
-                                if ui.button("Clear").clicked() {
-                                    self.apply_command(AppCommand::ClearAutoAdvanceSlideOverride(
-                                        display_index,
-                                    ));
-                                    self.sync_auto_advance_profile_to_config();
-                                    self.auto_override_editor_secs =
-                                        self.state.auto_advance_effective_interval_secs(display_index);
-                                }
-                            });
-
-                            let effective = self.state.auto_advance_effective_interval_secs(display_index);
-                            let countdown = self
-                                .state
-                                .auto_advance_remaining(Instant::now())
-                                .map(Self::format_duration)
-                                .unwrap_or_else(|| "--:--:--".to_owned());
-                            quiet_label(ui, palette, format!("Effective interval: {effective}s"));
-                            quiet_label(ui, palette, format!("Next advance in: {countdown}"));
-                        });
-
-                        ui.add_space(6.0);
-                        self.card_frame().show(ui, |ui| {
-                            section_title(ui, palette, "Annotations", Some("pen and PDF notes"));
-                            quiet_label(ui, palette, "Laser: hold Ctrl+click/drag for temporary pointer, or press L for persistent pointer.");
-                            ui.horizontal(|ui| {
-                                let draw_selected =
-                                    self.interaction_mode() == InteractionMode::HighlightDraw;
-                                if ui
-                                    .selectable_label(draw_selected, "Draw Highlight (H)")
-                                    .clicked()
-                                {
-                                    if !draw_selected {
-                                        self.state.highlight_enabled = true;
-                                        self.annotation_edit_enabled = false;
-                                    } else {
-                                        self.state.highlight_enabled = false;
-                                        self.stroke_in_progress.clear();
-                                        self.stroke_in_progress_style = None;
-                                    }
-                                }
-
-                                let edit_selected =
-                                    self.interaction_mode() == InteractionMode::AnnotationEdit;
-                                if ui
-                                    .selectable_label(edit_selected, "Edit Notes (A)")
-                                    .clicked()
-                                {
-                                    self.annotation_edit_enabled = !edit_selected;
-                                    if self.annotation_edit_enabled {
-                                        self.state.highlight_enabled = false;
-                                        self.stroke_in_progress.clear();
-                                        self.stroke_in_progress_style = None;
-                                    }
-                                }
-                            });
-                            ui.add_space(4.0);
-                            self.render_pen_toolkit_controls(ui, false, display_index);
-
-                            if self.document_dirty() {
-                                ui.colored_label(palette.warning, "Unsaved annotation changes");
-                            }
-
-                            if self.interaction_mode() == InteractionMode::AnnotationEdit {
-                                ui.separator();
-                                ui.horizontal(|ui| {
-                                    ui.label("New note:");
-                                    ui.text_edit_singleline(&mut self.pending_text_annotation);
-                                    if ui.button("Add").clicked() {
-                                        self.add_text_annotation_for_current_slide(
-                                            display_index,
-                                            display_layout,
-                                        );
-                                    }
-                                });
-
-                                if self.text_annotations.is_empty() {
-                                    ui.label("No text annotations on this slide.");
-                                } else {
-                                    for annotation in &mut self.text_annotations {
-                                        ui.separator();
-                                        ui.horizontal(|ui| {
-                                            let selected = self
-                                                .selected_annotation_id
-                                                .as_ref()
-                                                .is_some_and(|id| id == &annotation.id);
-                                            if ui
-                                                .selectable_label(
-                                                    selected,
-                                                    format!("ID {}", annotation.id),
-                                                )
-                                                .clicked()
-                                            {
-                                                self.selected_annotation_id =
-                                                    Some(annotation.id.clone());
-                                            }
-                                            ui.label(format!(
-                                                "Rect {:.0},{:.0}-{:.0},{:.0}",
-                                                annotation.rect.left,
-                                                annotation.rect.bottom,
-                                                annotation.rect.right,
-                                                annotation.rect.top
-                                            ));
-                                        });
-                                        ui.label(format!(
-                                            "Status: {} | Priority: {}",
-                                            annotation.metadata.status.as_str(),
-                                            annotation.metadata.priority.as_str()
-                                        ));
-                                    }
-
-                                    let selected_index = self
-                                        .selected_annotation_id
-                                        .as_ref()
-                                        .and_then(|id| {
-                                            self.text_annotations
-                                                .iter()
-                                                .position(|entry| &entry.id == id)
-                                        });
-                                    if let Some(selected_index) = selected_index {
-                                        ui.separator();
-                                        ui.label("Selected annotation details:");
-                                        {
-                                            let annotation = &mut self.text_annotations[selected_index];
-                                            ui.label("Text:");
-                                            ui.text_edit_multiline(&mut annotation.contents);
-
-                                            ui.horizontal(|ui| {
-                                                ui.label("Author:");
-                                                ui.text_edit_singleline(&mut annotation.metadata.author);
-                                            });
-
-                                            ui.horizontal(|ui| {
-                                                ui.label("Color:");
-                                                let mut rgb = [
-                                                    annotation.metadata.color_rgb.0,
-                                                    annotation.metadata.color_rgb.1,
-                                                    annotation.metadata.color_rgb.2,
-                                                ];
-                                                if egui::color_picker::color_edit_button_rgb(ui, &mut rgb)
-                                                    .changed()
-                                                {
-                                                    annotation.metadata.color_rgb =
-                                                        (rgb[0], rgb[1], rgb[2]);
-                                                }
-                                            });
-
-                                            ui.horizontal(|ui| {
-                                                ui.label("Tags:");
-                                                let mut tags_csv = annotation.metadata.tags.join(", ");
-                                                if ui.text_edit_singleline(&mut tags_csv).changed() {
-                                                    annotation.metadata.tags = Self::parse_tags(&tags_csv);
-                                                }
-                                            });
-
-                                            ui.horizontal(|ui| {
-                                                ui.label("Priority:");
-                                                egui::ComboBox::from_id_salt(format!(
-                                                    "priority_{}",
-                                                    annotation.id
-                                                ))
-                                                .selected_text(annotation.metadata.priority.as_str())
-                                                .show_ui(ui, |ui| {
-                                                    ui.selectable_value(
-                                                        &mut annotation.metadata.priority,
-                                                        AnnotationPriority::Low,
-                                                        "low",
-                                                    );
-                                                    ui.selectable_value(
-                                                        &mut annotation.metadata.priority,
-                                                        AnnotationPriority::Medium,
-                                                        "medium",
-                                                    );
-                                                    ui.selectable_value(
-                                                        &mut annotation.metadata.priority,
-                                                        AnnotationPriority::High,
-                                                        "high",
-                                                    );
-                                                });
-                                            });
-
-                                            ui.horizontal(|ui| {
-                                                ui.label("Status:");
-                                                egui::ComboBox::from_id_salt(format!(
-                                                    "status_{}",
-                                                    annotation.id
-                                                ))
-                                                .selected_text(annotation.metadata.status.as_str())
-                                                .show_ui(ui, |ui| {
-                                                    ui.selectable_value(
-                                                        &mut annotation.metadata.status,
-                                                        AnnotationStatus::Open,
-                                                        "open",
-                                                    );
-                                                    ui.selectable_value(
-                                                        &mut annotation.metadata.status,
-                                                        AnnotationStatus::InProgress,
-                                                        "in_progress",
-                                                    );
-                                                    ui.selectable_value(
-                                                        &mut annotation.metadata.status,
-                                                        AnnotationStatus::Done,
-                                                        "done",
-                                                    );
-                                                });
-                                            });
-
-                                            ui.label(format!(
-                                                "Modified: {}",
-                                                annotation
-                                                    .metadata
-                                                    .modified_at
-                                                    .clone()
-                                                    .unwrap_or_else(|| "N/A".to_owned())
-                                            ));
-                                        }
-
-                                        let transform_dirty = self.selected_transform_dirty();
-                                        let metadata_dirty = self.selected_metadata_dirty();
-                                        if transform_dirty {
-                                            ui.colored_label(
-                                                palette.accent,
-                                                "Geometry changed on canvas. Apply or revert before save.",
-                                            );
-                                        }
-
-                                        ui.horizontal(|ui| {
-                                            if ui
-                                                .add_enabled(
-                                                    transform_dirty,
-                                                    egui::Button::new("Apply Transform"),
-                                                )
-                                                .clicked()
-                                            {
-                                                self.commit_selected_annotation_update(
-                                                    "Annotation transform applied (unsaved).",
-                                                );
-                                            }
-
-                                            if ui
-                                                .add_enabled(
-                                                    transform_dirty,
-                                                    egui::Button::new("Revert Transform"),
-                                                )
-                                                .clicked()
-                                            {
-                                                self.revert_selected_transform();
-                                            }
-
-                                            if ui
-                                                .add_enabled(
-                                                    transform_dirty || metadata_dirty,
-                                                    egui::Button::new("Update Selected"),
-                                                )
-                                                .clicked()
-                                            {
-                                                self.commit_selected_annotation_update(
-                                                    "Text annotation updated (unsaved).",
-                                                );
-                                            }
-
-                                            if ui.button("Delete Selected").clicked() {
-                                                self.delete_selected_note(display_index);
-                                            }
-                                        });
-                                    }
-                                }
-                            } else if self.interaction_mode() == InteractionMode::HighlightDraw {
-                                ui.label(
-                                    "Drag to draw highlights. Hold Shift for straight lines. Toggle eraser (E) to remove session strokes. Save to write changes to file.",
-                                );
-                            }
-                        });
-                        ui.add_space(6.0);
-                        self.render_keybindings_editor(ui);
+                                        .unwrap_or("End of deck"),
+                                )
+                                .small()
+                                .color(palette.text_secondary),
+                            )
+                            .truncate(),
+                        );
                     });
-                    },
+                    if let Some(texture) = self.next_texture.as_ref() {
+                        let area_size = Vec2::new(ui.available_width(), next_height);
+                        let target = Self::fit_size(texture.size_vec2(), area_size);
+                        let (area, _) = ui.allocate_exact_size(
+                            Vec2::new(area_size.x, target.y),
+                            Sense::hover(),
+                        );
+                        let image_rect = Rect::from_center_size(area.center(), target);
+                        let response = ui.put(image_rect, egui::Image::new((texture.id(), target)));
+                        if self.next_texture_pending {
+                            let label = if self.next_texture_low_res {
+                                "Sharpening next"
+                            } else {
+                                "Rendering next"
+                            };
+                            Self::draw_rendering_overlay(ui, response.rect, palette, label);
+                        }
+                    } else {
+                        quiet_label(
+                            ui,
+                            palette,
+                            if self.next_texture_pending {
+                                "Rendering next slide…"
+                            } else {
+                                "No next slide."
+                            },
+                        );
+                    }
+                });
+
+                self.card_frame().show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    section_heading(ui, palette, "Navigator");
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            Vec2::new(120.0, ui.spacing().interact_size.y),
+                            egui::TextEdit::singleline(&mut self.go_to_input)
+                                .hint_text(if self.state.use_slide_labels() {
+                                    "Slide label"
+                                } else {
+                                    "Page number"
+                                }),
+                        );
+                        if ui
+                            .button("Go")
+                            .on_hover_text(self.shortcut_hint("Go to slide", ShortcutAction::GoTo))
+                            .clicked()
+                        {
+                            self.submit_go_to();
+                        }
+                        let mode_label = if self.state.use_slide_labels() {
+                            "By label"
+                        } else {
+                            "By page"
+                        };
+                        if ui
+                            .button(mode_label)
+                            .on_hover_text(self.shortcut_hint(
+                                "Switch between page numbers and slide labels",
+                                ShortcutAction::ToggleLabelMode,
+                            ))
+                            .clicked()
+                        {
+                            self.apply_command(AppCommand::ToggleLabelMode);
+                        }
+                    });
+                    quiet_label(
+                        ui,
+                        palette,
+                        format!(
+                            "Label {}  ·  Next {}",
+                            self.state.label_at(display_index).unwrap_or("N/A"),
+                            self.state
+                                .next_label_from(display_index)
+                                .unwrap_or("End of deck")
+                        ),
+                    );
+                });
+
+                self.card_frame().show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    self.render_auto_advance_section(ui, palette, display_index);
+                });
+
+                self.card_frame().show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    let edit_mode = self.interaction_mode() == InteractionMode::AnnotationEdit;
+                    let last_edit_mode_id = egui::Id::unique("annotations_last_edit_mode");
+                    let last_edit_mode =
+                        ui.data_mut(|data| data.get_temp::<bool>(last_edit_mode_id));
+                    ui.data_mut(|data| data.insert_temp(last_edit_mode_id, edit_mode));
+                    let force_open = (last_edit_mode != Some(edit_mode) && edit_mode).then_some(true);
+                    let title = if self.document_dirty() {
+                        "Annotations · unsaved"
+                    } else {
+                        "Annotations"
+                    };
+                    egui::CollapsingHeader::new(section_header_text(palette, title))
+                        .id_salt("annotations_section")
+                        .default_open(false)
+                        .open(force_open)
+                        .show(ui, |ui| {
+                            self.render_annotations_body(ui, palette, display_index, display_layout);
+                        });
+                });
+            });
+    }
+
+    fn render_auto_advance_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        palette: ThemePalette,
+        display_index: usize,
+    ) {
+        let enabled = self.state.auto_advance_enabled();
+        let title = if enabled {
+            "Auto-Advance · on"
+        } else {
+            "Auto-Advance · off"
+        };
+        egui::CollapsingHeader::new(section_header_text(palette, title))
+            .id_salt("auto_advance_section")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(toggle_button(enabled, if enabled { "On" } else { "Off" }))
+                        .on_hover_text(self.shortcut_hint(
+                            "Toggle auto-advance",
+                            ShortcutAction::ToggleAutoAdvance,
+                        ))
+                        .clicked()
+                    {
+                        self.apply_command(AppCommand::ToggleAutoAdvance);
+                    }
+                    ui.label("Interval");
+                    let mut global_secs = self.state.auto_advance_global_interval_secs();
+                    let global_changed = ui
+                        .add(
+                            egui::DragValue::new(&mut global_secs)
+                                .range(1..=3600)
+                                .speed(0.5)
+                                .suffix(" s"),
+                        )
+                        .changed();
+                    if global_changed {
+                        self.apply_command(AppCommand::SetAutoAdvanceGlobalInterval(global_secs));
+                        self.sync_auto_advance_profile_to_config();
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label(format!("Slide {} override", display_index + 1));
+                    ui.add(
+                        egui::DragValue::new(&mut self.auto_override_editor_secs)
+                            .range(1..=3600)
+                            .speed(0.5)
+                            .suffix(" s"),
+                    );
+                    if ui.button("Set").clicked() {
+                        self.apply_command(AppCommand::SetAutoAdvanceSlideOverride {
+                            index: display_index,
+                            secs: self.auto_override_editor_secs,
+                        });
+                        self.sync_auto_advance_profile_to_config();
+                        self.auto_override_editor_secs = self
+                            .state
+                            .auto_advance_effective_interval_secs(display_index);
+                    }
+                    if ui.button("Clear").clicked() {
+                        self.apply_command(AppCommand::ClearAutoAdvanceSlideOverride(
+                            display_index,
+                        ));
+                        self.sync_auto_advance_profile_to_config();
+                        self.auto_override_editor_secs = self
+                            .state
+                            .auto_advance_effective_interval_secs(display_index);
+                    }
+                });
+
+                let effective = self
+                    .state
+                    .auto_advance_effective_interval_secs(display_index);
+                let countdown = self
+                    .state
+                    .auto_advance_remaining(Instant::now())
+                    .map(Self::format_duration)
+                    .unwrap_or_else(|| "--:--:--".to_owned());
+                quiet_label(
+                    ui,
+                    palette,
+                    format!("Effective interval {effective}s  ·  next advance in {countdown}"),
                 );
             });
+    }
 
+    fn render_annotations_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        palette: ThemePalette,
+        display_index: usize,
+        display_layout: Option<NotesLayout>,
+    ) {
+        self.render_pen_toolkit_controls(ui, false, display_index);
+
+        if self.document_dirty() {
+            ui.colored_label(palette.warning, "Unsaved annotation changes");
+        }
+
+        if self.interaction_mode() == InteractionMode::AnnotationEdit {
             ui.separator();
             ui.horizontal(|ui| {
-                ui.label("Notes Mode:");
-                let mut changed = false;
-                egui::ComboBox::from_id_salt("notes_mode")
-                    .selected_text(match self.config.notes_mode {
-                        NotesMode::Auto => "Auto",
-                        NotesMode::PdfAnnotations => "PDF annotations",
-                        NotesMode::BeamerSecondScreen => "Beamer second screen",
-                        NotesMode::LibreOfficeNotes => "LibreOffice notes",
-                    })
-                    .show_ui(ui, |ui| {
-                        changed |= ui
-                            .selectable_value(&mut self.config.notes_mode, NotesMode::Auto, "Auto")
-                            .changed();
-                        changed |= ui
-                            .selectable_value(
-                                &mut self.config.notes_mode,
-                                NotesMode::PdfAnnotations,
-                                "PDF annotations",
-                            )
-                            .changed();
-                        changed |= ui
-                            .selectable_value(
-                                &mut self.config.notes_mode,
-                                NotesMode::BeamerSecondScreen,
-                                "Beamer second screen",
-                            )
-                            .changed();
-                        changed |= ui
-                            .selectable_value(
-                                &mut self.config.notes_mode,
-                                NotesMode::LibreOfficeNotes,
-                                "LibreOffice notes",
-                            )
-                            .changed();
+                ui.label("New note:");
+                ui.text_edit_singleline(&mut self.pending_text_annotation);
+                if ui.button("Add").clicked() {
+                    self.add_text_annotation_for_current_slide(display_index, display_layout);
+                }
+            });
+
+            if self.text_annotations.is_empty() {
+                ui.label("No text annotations on this slide.");
+            } else {
+                for annotation in &mut self.text_annotations {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        let selected = self
+                            .selected_annotation_id
+                            .as_ref()
+                            .is_some_and(|id| id == &annotation.id);
+                        if ui
+                            .selectable_label(selected, format!("ID {}", annotation.id))
+                            .clicked()
+                        {
+                            self.selected_annotation_id = Some(annotation.id.clone());
+                        }
+                        ui.label(format!(
+                            "Rect {:.0},{:.0}-{:.0},{:.0}",
+                            annotation.rect.left,
+                            annotation.rect.bottom,
+                            annotation.rect.right,
+                            annotation.rect.top
+                        ));
                     });
-                if changed {
-                    self.invalidate_render_cache();
-                    self.persist_config();
+                    ui.label(format!(
+                        "Status: {} | Priority: {}",
+                        annotation.metadata.status.as_str(),
+                        annotation.metadata.priority.as_str()
+                    ));
                 }
 
+                let selected_index = self.selected_annotation_id.as_ref().and_then(|id| {
+                    self.text_annotations
+                        .iter()
+                        .position(|entry| &entry.id == id)
+                });
+                if let Some(selected_index) = selected_index {
+                    ui.separator();
+                    ui.label("Selected annotation details:");
+                    {
+                        let annotation = &mut self.text_annotations[selected_index];
+                        ui.label("Text:");
+                        ui.text_edit_multiline(&mut annotation.contents);
+
+                        ui.horizontal(|ui| {
+                            ui.label("Author:");
+                            ui.text_edit_singleline(&mut annotation.metadata.author);
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Color:");
+                            let mut rgb = [
+                                annotation.metadata.color_rgb.0,
+                                annotation.metadata.color_rgb.1,
+                                annotation.metadata.color_rgb.2,
+                            ];
+                            if egui::color_picker::color_edit_button_rgb(ui, &mut rgb).changed() {
+                                annotation.metadata.color_rgb = (rgb[0], rgb[1], rgb[2]);
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Tags:");
+                            let mut tags_csv = annotation.metadata.tags.join(", ");
+                            if ui.text_edit_singleline(&mut tags_csv).changed() {
+                                annotation.metadata.tags = Self::parse_tags(&tags_csv);
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Priority:");
+                            egui::ComboBox::from_id_salt(format!("priority_{}", annotation.id))
+                                .selected_text(annotation.metadata.priority.as_str())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut annotation.metadata.priority,
+                                        AnnotationPriority::Low,
+                                        "low",
+                                    );
+                                    ui.selectable_value(
+                                        &mut annotation.metadata.priority,
+                                        AnnotationPriority::Medium,
+                                        "medium",
+                                    );
+                                    ui.selectable_value(
+                                        &mut annotation.metadata.priority,
+                                        AnnotationPriority::High,
+                                        "high",
+                                    );
+                                });
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Status:");
+                            egui::ComboBox::from_id_salt(format!("status_{}", annotation.id))
+                                .selected_text(annotation.metadata.status.as_str())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut annotation.metadata.status,
+                                        AnnotationStatus::Open,
+                                        "open",
+                                    );
+                                    ui.selectable_value(
+                                        &mut annotation.metadata.status,
+                                        AnnotationStatus::InProgress,
+                                        "in_progress",
+                                    );
+                                    ui.selectable_value(
+                                        &mut annotation.metadata.status,
+                                        AnnotationStatus::Done,
+                                        "done",
+                                    );
+                                });
+                        });
+
+                        ui.label(format!(
+                            "Modified: {}",
+                            annotation
+                                .metadata
+                                .modified_at
+                                .clone()
+                                .unwrap_or_else(|| "N/A".to_owned())
+                        ));
+                    }
+
+                    let transform_dirty = self.selected_transform_dirty();
+                    let metadata_dirty = self.selected_metadata_dirty();
+                    if transform_dirty {
+                        ui.colored_label(
+                            palette.accent,
+                            "Geometry changed on canvas. Apply or revert before save.",
+                        );
+                    }
+
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(transform_dirty, egui::Button::new("Apply Transform"))
+                            .clicked()
+                        {
+                            self.commit_selected_annotation_update(
+                                "Annotation transform applied (unsaved).",
+                            );
+                        }
+
+                        if ui
+                            .add_enabled(transform_dirty, egui::Button::new("Revert Transform"))
+                            .clicked()
+                        {
+                            self.revert_selected_transform();
+                        }
+
+                        if ui
+                            .add_enabled(
+                                transform_dirty || metadata_dirty,
+                                egui::Button::new("Update Selected"),
+                            )
+                            .clicked()
+                        {
+                            self.commit_selected_annotation_update(
+                                "Text annotation updated (unsaved).",
+                            );
+                        }
+
+                        if ui.button("Delete Selected").clicked() {
+                            self.delete_selected_note(display_index);
+                        }
+                    });
+                }
+            }
+        } else if self.interaction_mode() == InteractionMode::HighlightDraw {
+            ui.label(
+                "Drag to draw highlights. Hold Shift for straight lines. Toggle eraser (E) to remove session strokes. Save to write changes to file.",
+            );
+        }
+    }
+
+    fn render_settings_window(&mut self, ctx: &Context) {
+        if !self.settings_open {
+            return;
+        }
+
+        let mut open = self.settings_open;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(500.0)
+            .default_height(560.0)
+            .frame(self.card_frame())
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    for tab in SettingsTab::ALL {
+                        if ui
+                            .add(egui::Button::selectable(
+                                self.settings_tab == tab,
+                                tab.label(),
+                            ))
+                            .clicked()
+                        {
+                            self.settings_tab = tab;
+                        }
+                    }
+                });
                 ui.separator();
-                let threshold_changed = ui
-                    .add(
-                        egui::Slider::new(&mut self.config.notes_confidence_threshold, 0.05..=0.95)
-                            .text("Auto split threshold"),
-                    )
-                    .changed();
-                if threshold_changed {
-                    self.invalidate_render_cache();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| match self.settings_tab {
+                        SettingsTab::General => self.render_general_settings(ui, ctx),
+                        SettingsTab::Notes => self.render_notes_settings(ui),
+                        SettingsTab::Performance => self.render_performance_controls(ui),
+                        SettingsTab::Keybindings => self.render_keybindings_editor(ui),
+                    });
+            });
+        self.settings_open = open && self.settings_open;
+    }
+
+    fn render_general_settings(&mut self, ui: &mut egui::Ui, ctx: &Context) {
+        egui::Grid::new("general_settings_grid")
+            .num_columns(2)
+            .spacing(Vec2::new(16.0, 10.0))
+            .show(ui, |ui| {
+                ui.label("Theme");
+                let mut theme_changed = false;
+                egui::ComboBox::from_id_salt("app_theme")
+                    .selected_text(theme_label(self.config.theme))
+                    .show_ui(ui, |ui| {
+                        for theme in [AppTheme::Dark, AppTheme::Light, AppTheme::ProjectorSafe] {
+                            theme_changed |= ui
+                                .selectable_value(&mut self.config.theme, theme, theme_label(theme))
+                                .changed();
+                        }
+                    });
+                if theme_changed {
+                    install_visual_style(ctx, self.config.theme);
                     self.persist_config();
                 }
+                ui.end_row();
 
-                ui.separator();
-                let slider_response = ui.add(
-                    egui::Slider::new(&mut self.config.presenter_layout.preview_slides, 1..=16)
-                        .text("Preview slides"),
-                );
-                if slider_response.changed() {
+                ui.label("Preview slides");
+                if ui
+                    .add(egui::Slider::new(
+                        &mut self.config.presenter_layout.preview_slides,
+                        1..=16,
+                    ))
+                    .changed()
+                {
                     self.persist_config();
                 }
+                ui.end_row();
 
-                ui.separator();
-                let overview_width_changed = ui
+                ui.label("Overview thumbnail width");
+                if ui
                     .add(
                         egui::Slider::new(&mut self.config.overview_thumbnail_width, 120..=800)
-                            .text("Overview thumb width"),
+                            .suffix(" px"),
                     )
-                    .changed();
-                if overview_width_changed {
+                    .changed()
+                {
                     self.config.overview_thumbnail_width =
                         self.config.overview_thumbnail_width.clamp(120, 800);
                     self.invalidate_render_cache();
                     self.persist_config();
                 }
+                ui.end_row();
 
-                let overview_cols_changed = ui
-                    .add(
-                        egui::Slider::new(&mut self.config.overview_columns, 2..=8)
-                            .text("Overview cols"),
-                    )
-                    .changed();
-                if overview_cols_changed {
+                ui.label("Overview columns");
+                if ui
+                    .add(egui::Slider::new(&mut self.config.overview_columns, 2..=8))
+                    .changed()
+                {
                     self.config.overview_columns = self.config.overview_columns.clamp(2, 8);
                     self.persist_config();
                 }
+                ui.end_row();
+            });
+    }
 
+    fn render_notes_settings(&mut self, ui: &mut egui::Ui) {
+        let palette = self.palette();
+        egui::Grid::new("notes_settings_grid")
+            .num_columns(2)
+            .spacing(Vec2::new(16.0, 10.0))
+            .show(ui, |ui| {
+                ui.label("Notes source");
+                let mut mode_changed = false;
+                egui::ComboBox::from_id_salt("notes_mode")
+                    .selected_text(Self::notes_mode_label(self.config.notes_mode))
+                    .show_ui(ui, |ui| {
+                        for mode in [
+                            NotesMode::Auto,
+                            NotesMode::PdfAnnotations,
+                            NotesMode::BeamerSecondScreen,
+                            NotesMode::LibreOfficeNotes,
+                        ] {
+                            mode_changed |= ui
+                                .selectable_value(
+                                    &mut self.config.notes_mode,
+                                    mode,
+                                    Self::notes_mode_label(mode),
+                                )
+                                .changed();
+                        }
+                    });
+                if mode_changed {
+                    self.invalidate_render_cache();
+                    self.persist_config();
+                }
+                ui.end_row();
+
+                ui.label("Auto split threshold");
+                if ui
+                    .add(egui::Slider::new(
+                        &mut self.config.notes_confidence_threshold,
+                        0.05..=0.95,
+                    ))
+                    .changed()
+                {
+                    self.invalidate_render_cache();
+                    self.persist_config();
+                }
+                ui.end_row();
             });
 
-            ui.horizontal(|ui| {
-                let enabled_changed = ui
-                    .checkbox(
-                        &mut self.manual_layout_override.enabled,
-                        "Manual split override",
-                    )
-                    .changed();
-
-                let mut override_changed = false;
-                if self.manual_layout_override.enabled {
-                    ui.label("Axis:");
+        ui.add_space(8.0);
+        section_heading(ui, palette, "Manual split");
+        let mut override_changed = ui
+            .checkbox(
+                &mut self.manual_layout_override.enabled,
+                "Override the automatic split for this PDF",
+            )
+            .changed();
+        let manual_enabled = self.manual_layout_override.enabled;
+        ui.add_enabled_ui(manual_enabled, |ui| {
+            egui::Grid::new("manual_split_grid")
+                .num_columns(2)
+                .spacing(Vec2::new(16.0, 10.0))
+                .show(ui, |ui| {
+                    ui.label("Axis");
                     egui::ComboBox::from_id_salt("manual_axis")
                         .selected_text(match self.manual_layout_override.axis {
                             SplitAxis::Vertical => "Vertical",
@@ -6261,110 +6477,72 @@ impl PresenterApp {
                                 )
                                 .changed();
                         });
+                    ui.end_row();
 
-                    ui.label("Notes Side:");
-                    let side_label = match self.manual_layout_override.notes_side {
-                        NotesSide::Left => "Left",
-                        NotesSide::Right => "Right",
-                        NotesSide::Top => "Top",
-                        NotesSide::Bottom => "Bottom",
+                    ui.label("Notes side");
+                    let side_options = match self.manual_layout_override.axis {
+                        SplitAxis::Vertical => {
+                            [(NotesSide::Left, "Left"), (NotesSide::Right, "Right")]
+                        }
+                        SplitAxis::Horizontal => {
+                            [(NotesSide::Top, "Top"), (NotesSide::Bottom, "Bottom")]
+                        }
                     };
                     egui::ComboBox::from_id_salt("manual_notes_side")
-                        .selected_text(side_label)
-                        .show_ui(ui, |ui| match self.manual_layout_override.axis {
-                            SplitAxis::Vertical => {
+                        .selected_text(match self.manual_layout_override.notes_side {
+                            NotesSide::Left => "Left",
+                            NotesSide::Right => "Right",
+                            NotesSide::Top => "Top",
+                            NotesSide::Bottom => "Bottom",
+                        })
+                        .show_ui(ui, |ui| {
+                            for (side, label) in side_options {
                                 override_changed |= ui
                                     .selectable_value(
                                         &mut self.manual_layout_override.notes_side,
-                                        NotesSide::Left,
-                                        "Left",
-                                    )
-                                    .changed();
-                                override_changed |= ui
-                                    .selectable_value(
-                                        &mut self.manual_layout_override.notes_side,
-                                        NotesSide::Right,
-                                        "Right",
-                                    )
-                                    .changed();
-                            }
-                            SplitAxis::Horizontal => {
-                                override_changed |= ui
-                                    .selectable_value(
-                                        &mut self.manual_layout_override.notes_side,
-                                        NotesSide::Top,
-                                        "Top",
-                                    )
-                                    .changed();
-                                override_changed |= ui
-                                    .selectable_value(
-                                        &mut self.manual_layout_override.notes_side,
-                                        NotesSide::Bottom,
-                                        "Bottom",
+                                        side,
+                                        label,
                                     )
                                     .changed();
                             }
                         });
+                    ui.end_row();
 
-                    override_changed |= ui
-                        .add(
-                            egui::Slider::new(
-                                &mut self.manual_layout_override.split_ratio,
-                                0.0..=1.0,
-                            )
-                            .text("Split ratio"),
-                        )
-                        .changed();
-                }
-
-                if enabled_changed || override_changed {
-                    self.manual_layout_override.sanitize();
-                    self.sync_override_to_config();
-                }
-            });
-
-            ui.horizontal(|ui| {
-                ui.label(format!(
-                    "Laser: {}",
-                    if self.state.laser_enabled {
-                        "On"
-                    } else {
-                        "Off"
+                    ui.label("Split");
+                    let mut split_percent =
+                        (self.manual_layout_override.split_ratio * 100.0).round() as i32;
+                    if ui
+                        .add(egui::Slider::new(&mut split_percent, 0..=100).suffix("%"))
+                        .changed()
+                    {
+                        self.manual_layout_override.split_ratio =
+                            (split_percent as f32 / 100.0).clamp(0.0, 1.0);
+                        override_changed = true;
                     }
-                ));
-                ui.label(format!(
-                    "Highlight: {}",
-                    if self.state.highlight_enabled {
-                        "On"
-                    } else {
-                        "Off"
-                    }
-                ));
-                ui.label(format!(
-                    "Annotation Edit: {}",
-                    if self.annotation_edit_enabled {
-                        "On"
-                    } else {
-                        "Off"
-                    }
-                ));
-            });
-
-            if let Some(status) = &self.status_message {
-                ui.separator();
-                ui.colored_label(palette.accent, status);
-            }
-            if let Some(warning) = &self.keybinding_warning {
-                ui.colored_label(palette.warning, warning);
-            }
-            if let Some(error) = &self.open_error {
-                ui.colored_label(palette.danger, error);
-            }
+                    ui.end_row();
+                });
         });
+        if !manual_enabled {
+            quiet_label(
+                ui,
+                palette,
+                "Turn on the override to set axis, side and split.",
+            );
+        }
 
-        self.render_deck_overview(ctx);
-        self.render_timing_breakdown(ctx);
-        self.render_performance_panel(ctx);
+        if override_changed {
+            self.manual_layout_override.sanitize();
+            self.sync_override_to_config();
+        }
+    }
+
+    fn notes_mode_label(mode: NotesMode) -> &'static str {
+        match mode {
+            NotesMode::Auto => "Auto",
+            NotesMode::PdfAnnotations => "PDF annotations",
+            NotesMode::BeamerSecondScreen => "Beamer second screen",
+            NotesMode::LibreOfficeNotes => "LibreOffice notes",
+        }
     }
 
     fn apply_overview_commit(&mut self) {
